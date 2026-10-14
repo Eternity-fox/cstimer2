@@ -46,15 +46,41 @@ var battle = execMain(function() {
 	}
 
 	// ==================== WebRTC Configuration & Utilities ====================
-	var RTC_SERVERS = {
-		iceServers: [
-			{ urls: 'stun:stun.qq.com:1863' },
-			{ urls: 'stun:stun.aliyun.com:3478' },
-			{ urls: 'stun:stun.cloudflare.com:3478' },
-			{ urls: 'stun:stun.l.google.com:19302' },
-			{ urls: 'stun:stun1.l.google.com:19302' }
-		]
-	};
+	// 【公网中继 TURN 服务器配置入口】
+	// 若未来需要开启中继支持（用于穿透对称型 NAT / 严格防火墙），可直接在下方填入您的 TURN 服务器：
+	// 例如：
+	// var CUSTOM_TURN_CONFIG = {
+	// 	urls: 'turn:cstimer.etfox.com.cn:3478',
+	// 	username: 'cstimer',
+	// 	credential: 'YourPassword123'
+	// };
+	var CUSTOM_TURN_CONFIG = null;
+
+	var DEFAULT_STUN_SERVERS = [
+		{ urls: 'stun:stun.aliyun.com:3478' },
+		{ urls: 'stun:stun.qq.com:1863' },
+		{ urls: 'stun:stun.miwifi.com:3478' },
+		{ urls: 'stun:stun.chat.bilibili.com:3478' },
+		{ urls: 'stun:stun.hitv.com:3478' },
+		{ urls: 'stun:stun.cloudflare.com:3478' }
+	];
+
+	function getRtcIceServers() {
+		var servers = DEFAULT_STUN_SERVERS.slice();
+		if (CUSTOM_TURN_CONFIG && CUSTOM_TURN_CONFIG.urls) {
+			servers.push(CUSTOM_TURN_CONFIG);
+		}
+		try {
+			var localTurn = localStorage.getItem('cstimer_custom_turn');
+			if (localTurn) {
+				var parsed = JSON.parse(localTurn);
+				if (parsed && parsed.urls) {
+					servers.push(parsed);
+				}
+			}
+		} catch (e) {}
+		return servers;
+	}
 
 	function createPeerConnection() {
 		var RTCPC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
@@ -62,38 +88,61 @@ var battle = execMain(function() {
 			alert('当前浏览器不支持 WebRTC，无法进行 P2P 直连对战！');
 			return null;
 		}
-		return new RTCPC(RTC_SERVERS);
+		return new RTCPC({
+			iceServers: getRtcIceServers()
+		});
 	}
 
-	function waitIceGathering(pc, timeoutMs) {
-		timeoutMs = timeoutMs || 1200;
+	function waitIceGathering(pc, maxTimeoutMs) {
+		maxTimeoutMs = maxTimeoutMs || 3500;
 		return new Promise(function(resolve) {
 			if (pc.iceGatheringState === 'complete') {
 				resolve();
 				return;
 			}
 			var timer = null;
+			var candidateCount = 0;
+			var hasSrflx = false;
+			var minWaitTimer = null;
+
 			function done() {
 				if (timer) {
 					clearTimeout(timer);
 					timer = null;
 				}
+				if (minWaitTimer) {
+					clearTimeout(minWaitTimer);
+					minWaitTimer = null;
+				}
 				pc.removeEventListener('icegatheringstatechange', onStateChange);
 				pc.onicecandidate = null;
 				resolve();
 			}
+
 			function onStateChange() {
 				if (pc.iceGatheringState === 'complete') {
 					done();
 				}
 			}
+
 			pc.onicecandidate = function(e) {
 				if (!e.candidate) {
 					done();
+					return;
+				}
+				candidateCount++;
+				var cand = e.candidate.candidate || '';
+				if (cand.indexOf('typ srflx') !== -1 || cand.indexOf('typ relay') !== -1) {
+					hasSrflx = true;
+				}
+				// 收集到公网反射 candidate 后，平滑等待 600ms 尽量收齐备选端口，然后提前返回
+				if (hasSrflx && candidateCount >= 2 && !minWaitTimer) {
+					minWaitTimer = setTimeout(done, 600);
 				}
 			};
+
 			pc.addEventListener('icegatheringstatechange', onStateChange);
-			timer = setTimeout(done, timeoutMs);
+			timer = setTimeout(done, maxTimeoutMs);
 		});
 	}
 
@@ -988,6 +1037,66 @@ var battle = execMain(function() {
 
 	// ==================== Handshake Modals (握手界面) ====================
 
+	// 可选的 TURN 中继设置面板组件
+	function createTurnConfigSection() {
+		var sec = $('<div style="margin-top: 15px; border-top: 1px dashed #bbb; padding-top: 8px; font-size: 0.8em; color: #666;"></div>');
+		var toggleBtn = $('<a href="javascript:void(0)" style="color: #666; text-decoration: underline; cursor: pointer;">⚙️ 高级网络设置 (TURN中继)</a>');
+		var content = $('<div style="display: none; margin-top: 8px; padding: 8px; background: rgba(0,0,0,0.03); border: 1px solid #ddd; border-radius: 4px;"></div>');
+
+		var savedTurn = null;
+		try { savedTurn = JSON.parse(localStorage.getItem('cstimer_custom_turn') || 'null'); } catch(e) {}
+
+		var urlInput = $('<input type="text" placeholder="TURN地址，例: turn:cstimer.etfox.com.cn:3478" style="width: 100%; box-sizing: border-box; margin-bottom: 4px; font-size: 0.85em;">');
+		var userInput = $('<input type="text" placeholder="用户名 (选填)" style="width: 48%; box-sizing: border-box; margin-right: 4%; font-size: 0.85em;">');
+		var pwdInput = $('<input type="password" placeholder="密码 (选填)" style="width: 48%; box-sizing: border-box; font-size: 0.85em;">');
+		var saveBtn = $('<input type="button" value="保存中继配置" style="margin-top: 6px; font-size: 0.8em;">');
+		var clearBtn = $('<input type="button" value="清空配置" style="margin-top: 6px; margin-left: 6px; font-size: 0.8em;">');
+		var tip = $('<span style="margin-left: 8px; font-size: 0.8em;"></span>');
+
+		if (savedTurn && savedTurn.urls) {
+			urlInput.val(savedTurn.urls);
+			userInput.val(savedTurn.username || '');
+			pwdInput.val(savedTurn.credential || '');
+		}
+
+		toggleBtn.click(function() {
+			content.toggle();
+		});
+
+		saveBtn.click(function() {
+			var u = urlInput.val().trim();
+			if (!u) {
+				localStorage.removeItem('cstimer_custom_turn');
+				tip.css('color', '#888').text('已清空中继，使用默认STUN打洞').show().fadeOut(3000);
+				return;
+			}
+			var cfg = { urls: u };
+			var user = userInput.val().trim();
+			var pwd = pwdInput.val().trim();
+			if (user) cfg.username = user;
+			if (pwd) cfg.credential = pwd;
+			localStorage.setItem('cstimer_custom_turn', JSON.stringify(cfg));
+			tip.css('color', 'green').text('中继配置已保存生效！').show().fadeOut(3000);
+		});
+
+		clearBtn.click(function() {
+			urlInput.val('');
+			userInput.val('');
+			pwdInput.val('');
+			localStorage.removeItem('cstimer_custom_turn');
+			tip.css('color', '#888').text('已恢复默认设置').show().fadeOut(2000);
+		});
+
+		content.append(
+			'<div style="margin-bottom: 4px; color: #555;">如在公网因双方对称 NAT 导致直连超时，可填入 TURN 中继服务器（选填）：</div>',
+			urlInput,
+			$('<div></div>').append(userInput, pwdInput),
+			$('<div></div>').append(saveBtn, clearBtn, tip)
+		);
+		sec.append(toggleBtn, content);
+		return sec;
+	}
+
 	// 1. Host Room Modal (创建主机房间)
 	function showHostModal() {
 		checkConnState(false);
@@ -1008,7 +1117,8 @@ var battle = execMain(function() {
 		answerSec.append('<div><b>步骤 2：接纳选手</b>（在下方粘贴选手发来的确认码）：</div>');
 		var answerInput = $('<textarea placeholder="在此粘贴选手的确认码..." style="width: 100%; height: 60px; margin: 6px 0; font-size: 0.8em; box-sizing: border-box;"></textarea>');
 		var btnAccept = $('<input type="button" class="buttonOK" value="接纳选手加入 (连接)" style="font-weight: bold; width: 100%; height: 32px; margin-top: 4px;">');
-		answerSec.append(answerInput, btnAccept);
+		var acceptStatusTip = $('<div style="margin-top: 6px; font-size: 0.85em; min-height: 20px; line-height: 1.4;"></div>');
+		answerSec.append(answerInput, btnAccept, acceptStatusTip);
 
 		modalDiv.append(
 			'<div style="color: #4a90e2; font-weight: bold; margin-bottom: 8px;">👑 房主主机模式 (设备对设备直连)</div>',
@@ -1017,11 +1127,20 @@ var battle = execMain(function() {
 			offerArea,
 			$('<div></div>').append(btnCopyOffer, btnCopyLink),
 			qrCanvas,
-			answerSec
+			answerSec,
+			createTurnConfigSection()
 		);
 
 		var currentHostPC = null;
 		var currentHostDC = null;
+		var hostConnectTimer = null;
+
+		function clearHostConnectTimer() {
+			if (hostConnectTimer) {
+				clearTimeout(hostConnectTimer);
+				hostConnectTimer = null;
+			}
+		}
 
 		function generateHostOffer() {
 			try {
@@ -1035,6 +1154,12 @@ var battle = execMain(function() {
 				compId = getMyAccountId();
 				hostEngine.init(roomId, compId);
 
+				clearHostConnectTimer();
+				if (currentHostPC) {
+					try { currentHostPC.close(); } catch(e) {}
+					currentHostPC = null;
+				}
+
 				var pc = createPeerConnection();
 				if (!pc) {
 					offerArea.val('创建失败：当前浏览器不支持 WebRTC');
@@ -1044,10 +1169,12 @@ var battle = execMain(function() {
 				var dc = pc.createDataChannel('cstimer_battle', { ordered: true });
 				currentHostDC = dc;
 
-				offerArea.val('正在生成设备连接信息，请稍候...');
+				offerArea.val('正在探测并获取公网连接信息，请稍候...');
+				btnGen.val('正在生成...');
 				var clientObj = { pc: pc, dc: dc, accountId: null };
 
 				function handleHostDCOpen() {
+					clearHostConnectTimer();
 					logohint.push('选手已成功接入！');
 					kernel.hideDialog();
 					hostEngine.broadcast();
@@ -1078,7 +1205,7 @@ var battle = execMain(function() {
 				pc.createOffer().then(function(offer) {
 					return pc.setLocalDescription(offer);
 				}).then(function() {
-					return waitIceGathering(pc, 1200);
+					return waitIceGathering(pc, 3500);
 				}).then(function() {
 					var token = encodeToken({
 						type: 'offer',
@@ -1087,6 +1214,7 @@ var battle = execMain(function() {
 					});
 					currentHostToken = token;
 					offerArea.val(token);
+					btnGen.val('生成邀请码');
 					var shareUrl = location.protocol + '//' + location.host + location.pathname + '#battleOffer=' + token;
 
 					btnCopyOffer.unbind('click').click(function() {
@@ -1110,10 +1238,12 @@ var battle = execMain(function() {
 					}
 				}).catch(function(err) {
 					offerArea.val('生成失败: ' + err);
+					btnGen.val('生成邀请码');
 				});
 			} catch (err) {
 				console.error('[Host generate error]', err);
 				offerArea.val('生成异常: ' + err);
+				btnGen.val('生成邀请码');
 			}
 		}
 
@@ -1124,23 +1254,68 @@ var battle = execMain(function() {
 				alert('请先生成邀请码！');
 				return;
 			}
+			// 1. 拦截重复点击与状态冲突，防止出现 Called in wrong state: stable 报错
+			if (currentHostPC.signalingState === 'stable') {
+				acceptStatusTip.html('<span style="color: #f80; font-weight: bold;">⚠️ 已提交接纳，通道正在打洞探测中，请耐心稍候...</span>');
+				return;
+			}
+
 			var ansToken = answerInput.val().trim();
 			var ansObj = decodeToken(ansToken);
 			if (!ansObj || ansObj.type !== 'answer') {
 				alert('确认码无效，请确保选手已正确生成并发送确认码！');
 				return;
 			}
+
+			// 2. 状态提示与按钮禁用
+			btnAccept.prop('disabled', true).val('⏳ 正在打通通道，请稍候...');
+			acceptStatusTip.html('<span style="color: #0288d1; font-weight: bold;">已收到确认码，正在向选手发起网络握手...</span>');
+
+			function updateHostIceState() {
+				if (!currentHostPC) return;
+				var state = currentHostPC.iceConnectionState || currentHostPC.connectionState;
+				if (state === 'checking') {
+					acceptStatusTip.html('<span style="color: #0288d1; font-weight: bold;">🌐 正在进行公网穿透探测 (ICE Checking)...</span>');
+				} else if (state === 'connected' || state === 'completed') {
+					acceptStatusTip.html('<span style="color: #2e7d32; font-weight: bold;">✅ 通道打通成功！正在同步数据进入房间...</span>');
+				} else if (state === 'failed' || state === 'disconnected') {
+					clearHostConnectTimer();
+					acceptStatusTip.html('<span style="color: #d32f2f; font-weight: bold;">❌ 公网穿透失败：受到网络防火墙或对称 NAT 拦截。<br>建议双方连接同一 Wi-Fi 或开启手机热点重试。</span>');
+					btnAccept.prop('disabled', false).val('重新接纳加入');
+				}
+			}
+
+			currentHostPC.oniceconnectionstatechange = updateHostIceState;
+			if ('onconnectionstatechange' in currentHostPC) {
+				currentHostPC.onconnectionstatechange = updateHostIceState;
+			}
+
+			clearHostConnectTimer();
+			hostConnectTimer = setTimeout(function() {
+				if (currentHostDC && currentHostDC.readyState !== 'open') {
+					var curState = currentHostPC ? currentHostPC.iceConnectionState : '';
+					if (curState === 'checking' || curState === 'new') {
+						acceptStatusTip.html('<span style="color: #d32f2f; font-weight: bold;">⚠️ 穿透超时：公网未能成功连通，可能是受到对称型 NAT 或端口防火墙隔离。</span>');
+						btnAccept.prop('disabled', false).val('重试接纳选手');
+					}
+				}
+			}, 15000);
+
 			currentHostPC.setRemoteDescription(new RTCSessionDescription({
 				type: 'answer',
 				sdp: ansObj.sdp
 			})).then(function() {
 				logohint.push('已提交确认，正在打通直连通道...');
+				updateHostIceState();
 				if (currentHostDC && currentHostDC.readyState === 'open') {
+					clearHostConnectTimer();
 					logohint.push('选手已成功接入！');
 					kernel.hideDialog();
 				}
 			}).catch(function(err) {
-				alert('连接建立失败: ' + err);
+				clearHostConnectTimer();
+				acceptStatusTip.html('<span style="color: #d32f2f; font-weight: bold;">连接建立失败: ' + err + '</span>');
+				btnAccept.prop('disabled', false).val('接纳选手加入 (连接)');
 			});
 		});
 
@@ -1156,6 +1331,7 @@ var battle = execMain(function() {
 		}
 
 		function onCancelHostModal() {
+			clearHostConnectTimer();
 			if (currentHostPC) {
 				try { currentHostPC.close(); } catch (e) {}
 				currentHostPC = null;
@@ -1188,7 +1364,7 @@ var battle = execMain(function() {
 		var answerArea = $('<textarea readonly style="width: 100%; height: 75px; margin: 6px 0; font-size: 0.8em; word-break: break-all; box-sizing: border-box;"></textarea>').click(function() { this.select(); });
 		var btnCopyAnswer = $('<input type="button" value="复制确认码">');
 		var qrCanvas = $('<canvas style="display: block; margin: 10px auto; background: #fff; padding: 6px; border: 1px solid #ccc;"></canvas>').hide();
-		var tipWait = $('<div style="color: #f80; margin-top: 6px;">等待房主在主机端点击【接纳】后即可秒连对战...</div>');
+		var tipWait = $('<div style="color: #f80; margin-top: 6px; font-size: 0.85em; line-height: 1.4;">等待房主在主机端点击【接纳】后即可秒连对战...</div>');
 		answerSec.append(answerArea, btnCopyAnswer, qrCanvas, tipWait);
 
 		modalDiv.append(
@@ -1196,7 +1372,8 @@ var battle = execMain(function() {
 			'<div><b>步骤 1：粘贴房主的邀请码</b></div>',
 			offerInput,
 			btnGenAnswer,
-			answerSec
+			answerSec,
+			createTurnConfigSection()
 		);
 
 		var currentClientPC = null;
@@ -1226,12 +1403,29 @@ var battle = execMain(function() {
 				}
 				currentClientPC = pc;
 
+				function updateClientIceState() {
+					if (!currentClientPC) return;
+					var state = currentClientPC.iceConnectionState || currentClientPC.connectionState;
+					if (state === 'checking') {
+						tipWait.html('<span style="color: #0288d1; font-weight: bold;">🌐 房主已提交接纳，正在打通公网通道 (ICE Checking)...</span>');
+					} else if (state === 'connected' || state === 'completed') {
+						tipWait.html('<span style="color: #2e7d32; font-weight: bold;">✅ 通道建立成功！正在同步进入房间...</span>');
+					} else if (state === 'failed' || state === 'disconnected') {
+						tipWait.html('<span style="color: #d32f2f; font-weight: bold;">❌ 公网穿透失败：受到网络防火墙或对称 NAT 拦截。建议双方连同一 Wi-Fi 或开启手机热点重试。</span>');
+					}
+				}
+
+				currentClientPC.oniceconnectionstatechange = updateClientIceState;
+				if ('onconnectionstatechange' in currentClientPC) {
+					currentClientPC.onconnectionstatechange = updateClientIceState;
+				}
+
 				pc.ondatachannel = function(e) {
 					var receivedDC = e.channel;
 					clientConn.setup(pc, receivedDC);
 				};
 
-				btnGenAnswer.val('正在处理...');
+				btnGenAnswer.val('正在获取公网连接信息...');
 				pc.setRemoteDescription(new RTCSessionDescription({
 					type: 'offer',
 					sdp: offerObj.sdp
@@ -1240,7 +1434,7 @@ var battle = execMain(function() {
 				}).then(function(answer) {
 					return pc.setLocalDescription(answer);
 				}).then(function() {
-					return waitIceGathering(pc, 1200);
+					return waitIceGathering(pc, 3500);
 				}).then(function() {
 					var token = encodeToken({
 						type: 'answer',
@@ -1249,6 +1443,7 @@ var battle = execMain(function() {
 					answerArea.val(token);
 					answerSec.show();
 					btnGenAnswer.val('生成确认码');
+					tipWait.html('<span style="color: #f80;">等待房主在主机端点击【接纳】后即可秒连对战...</span>');
 
 					btnCopyAnswer.unbind('click').click(function() {
 						copyToClipboard(token, '确认码已复制！请发给房主');
