@@ -149,12 +149,14 @@ async def handle_connection(reader, writer):
     peer = writer.get_extra_info('peername')
     print(f"\n[收到新连接] 来源: {peer}")
     try:
-        # 读取 HTTP 请求头
-        request_line = await reader.readline()
+        # 读取 HTTP 请求头（超时5秒防止挂起）
+        request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
         if not request_line:
+            print("[连接关闭] 未收到任何请求数据即断开")
             writer.close()
             return
         req_str = request_line.decode("utf-8", errors="ignore").strip()
+        print(f"[收到请求行] {req_str}")
         parts = req_str.split()
         if len(parts) < 2:
             writer.close()
