@@ -205,7 +205,7 @@ var battle = execMain(function() {
 		ta.remove();
 	}
 
-	// ==================== Official WebSocket Connection ====================
+	// ==================== WebSocket Connection (支持官方服务器与本地/穿透服务) ====================
 	var wsConn = (function() {
 		var socket;
 		var isOpen = false;
@@ -214,14 +214,53 @@ var battle = execMain(function() {
 		var TIMEOUT = 5000;
 		var callback = null;
 		var toResolves = [];
+		var activeWsUrl = 'wss://cstimer.net/ws20230409';
 
-		function connect() {
-			if (isOpen) {
+		function formatWsUrl(raw) {
+			if (!raw) {
+				var proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+				return proto + location.host + '/ws';
+			}
+			raw = raw.trim();
+			if (!/^wss?:\/\//i.test(raw)) {
+				// 纯 IP 地址（例如 36.213.26.203:50615）无 SSL 证书，强制使用 ws://
+				var isIpAddr = /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)?(\/.*)?$/i.test(raw);
+				var proto = (!isIpAddr && location.protocol === 'https:' && !/^127\.|^localhost/i.test(raw)) ? 'wss://' : 'ws://';
+				raw = proto + raw;
+			}
+			if (!/\/ws$/i.test(raw) && raw.indexOf('/ws20230409') === -1 && raw.indexOf('/', 8) === -1) {
+				raw += '/ws';
+			}
+			return raw;
+		}
+
+		function connect(targetUrl) {
+			targetUrl = formatWsUrl(targetUrl || activeWsUrl);
+			activeWsUrl = targetUrl;
+			if (isOpen && socket && socket.url === targetUrl) {
 				return Promise.resolve();
 			}
-			return new Promise(function(resolve) {
-				toResolves.push(resolve);
-				socket = new WebSocket('wss://cstimer.net/ws20230409');
+			if (socket) {
+				try { socket.close(); } catch (e) {}
+				isOpen = false;
+			}
+			return new Promise(function(resolve, reject) {
+				var connectTimer = setTimeout(function() {
+					reject(new Error('连接超时 (5秒)，请确认本地 start.bat 已重新启动且穿透软件已开启'));
+				}, 5000);
+
+				toResolves.push(function() {
+					clearTimeout(connectTimer);
+					resolve();
+				});
+
+				try {
+					socket = new WebSocket(targetUrl);
+				} catch (e) {
+					clearTimeout(connectTimer);
+					reject(e);
+					return;
+				}
 				socket.onopen = function() {
 					isOpen = true;
 					while (toResolves.length > 0) {
@@ -232,19 +271,25 @@ var battle = execMain(function() {
 					isOpen = false;
 					callback && callback('close');
 				};
-				socket.onerror = function() {
+				socket.onerror = function(err) {
+					clearTimeout(connectTimer);
 					isOpen = false;
+					reject(new Error('无法连接到 WebSocket 服务器: ' + targetUrl));
 					callback && callback('error');
 				};
 				socket.onmessage = function(e) {
-					var msg = JSON.parse(e.data);
-					var msgid = msg['msgid'];
-					if (msgid in waitList) {
-						var res = waitList[msgid];
-						delete waitList[msgid];
-						res(msg);
-					} else {
-						callback && callback('msg', msg);
+					try {
+						var msg = JSON.parse(e.data);
+						var msgid = msg['msgid'];
+						if (msgid in waitList) {
+							var res = waitList[msgid];
+							delete waitList[msgid];
+							res(msg);
+						} else {
+							callback && callback('msg', msg);
+						}
+					} catch (parseErr) {
+						console.error('[ws parse error]', parseErr);
 					}
 				};
 			});
@@ -1529,6 +1574,108 @@ var battle = execMain(function() {
 		});
 	}
 
+	// 4. Tunnel / Self-Hosted Server Join (内网穿透 / 自建对战服务)
+	function showTunnelBattleModal(prefilledServer, prefilledRoom) {
+		checkConnState(false);
+		var modalDiv = $('<div style="text-align: left; padding: 14px; width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; font-size: 0.9em;"></div>');
+
+		var defServer = prefilledServer || localStorage.getItem('cstimer_tunnel_server') || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+		var defRoom = prefilledRoom || roomId || ('' + (100 + ~~(Math.random() * 900)));
+
+		var serverInput = $('<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px; font-size: 0.9em; margin: 4px 0 10px 0;">').val(defServer);
+		var roomInput = $('<input type="text" style="width: 140px; box-sizing: border-box; padding: 5px; font-size: 0.9em; margin: 4px 0 12px 0;">').val(defRoom);
+
+		var btnConnect = $('<input type="button" class="buttonOK" value="🚀 连接并进入房间" style="font-weight: bold; padding: 6px 14px; margin-right: 10px;">');
+		var statusTip = $('<div style="margin-top: 10px; font-size: 0.85em; min-height: 20px;"></div>');
+
+		var shareSec = $('<div style="margin-top: 14px; border-top: 1px dashed #bbb; padding-top: 10px; display: none;"></div>');
+		var shareUrlInput = $('<input type="text" readonly style="width: 100%; box-sizing: border-box; font-size: 0.8em; padding: 5px; margin: 4px 0 6px 0;">').click(function() { this.select(); });
+		var btnCopyShare = $('<input type="button" value="复制对战邀请链接" style="margin-right: 8px;">');
+		var qrCanvas = $('<canvas style="display: block; margin: 10px auto; background: #fff; padding: 6px; border: 1px solid #ccc;"></canvas>');
+		shareSec.append('<div style="font-weight: bold; color: #2e7d32;">🔗 专属好友秒连链接（发给好友点击即连）：</div>', shareUrlInput, btnCopyShare, qrCanvas);
+
+		modalDiv.append(
+			'<div style="color: #2e7d32; font-weight: bold; font-size: 1.1em; margin-bottom: 8px;">🚀 内网穿透 / 本地服务器秒连模式</div>',
+			'<div style="color: #666; font-size: 0.85em; margin-bottom: 12px; line-height: 1.4;">无需复制邀请码/确认码，纯 WebSocket 直连，100% 连通无阻！</div>',
+			'<div style="color: #333; margin-bottom: 4px;"><b>1. 服务器地址 (WebSocket)：</b><br><span style="font-size: 0.8em; color: #888;">填入内网穿透公网地址（如 <code>abc.cpolar.top:12345</code>）或本地地址：</span></div>',
+			serverInput,
+			'<div style="color: #333; margin-bottom: 4px;"><b>2. 对战房间号：</b></div>',
+			roomInput,
+			$('<div></div>').append(btnConnect),
+			statusTip,
+			shareSec
+		);
+
+		btnConnect.click(function() {
+			var sUrl = serverInput.val().trim();
+			var rId = roomInput.val().trim();
+			if (!sUrl) { alert('请输入对战服务器地址！'); return; }
+			if (!rId) { alert('请输入房间号！'); return; }
+
+			localStorage.setItem('cstimer_tunnel_server', sUrl);
+			statusTip.html('<span style="color: #0288d1; font-weight: bold;">⏳ 正在连接服务器...</span>');
+			btnConnect.prop('disabled', true);
+
+			battleMode = 'server';
+			roomId = rId;
+			compId = getMyAccountId();
+
+			wsConn.connect(sUrl).then(function() {
+				statusTip.html('<span style="color: #2e7d32; font-weight: bold;">✅ 服务器连接成功，正在加入房间 ' + rId + ' ...</span>');
+				joinServerRoomWithId(rId);
+
+				// 构造好友秒连 URL
+				var rawHost = sUrl.replace(/^wss?:\/\//i, '').replace(/\/ws$/i, '');
+				var shareBase = location.protocol + '//' + location.host + location.pathname;
+				var fullShareUrl = shareBase + '#battleServer=' + encodeURIComponent(rawHost) + '&room=' + encodeURIComponent(rId);
+				shareUrlInput.val(fullShareUrl);
+
+				btnCopyShare.unbind('click').click(function() {
+					copyToClipboard(fullShareUrl, '对战秒连链接已复制！');
+					btnCopyShare.val('✓ 已复制链接');
+					setTimeout(function() { btnCopyShare.val('复制对战邀请链接'); }, 2000);
+				});
+
+				if (window.QRCode && qrCanvas[0]) {
+					try {
+						QRCode.draw(qrCanvas[0], fullShareUrl, 150);
+						qrCanvas.show();
+					} catch (e) {
+						qrCanvas.hide();
+					}
+				}
+				shareSec.show();
+				btnConnect.prop('disabled', false).val('进入对战房间');
+				btnConnect.unbind('click').click(function() {
+					kernel.hideDialog();
+				});
+			}).catch(function(err) {
+				statusTip.html('<span style="color: #d32f2f; font-weight: bold;">❌ 连接失败: ' + err + '<br>请确认本地已运行 <code>start.bat</code>，且内网穿透端口与地址填写正确。</span>');
+				btnConnect.prop('disabled', false);
+			});
+		});
+
+		function applyModalLayout() {
+			$('.dialog').css({
+				'left': '15%',
+				'right': '15%',
+				'top': '10%',
+				'bottom': '10%',
+				'min-height': '380px',
+				'min-width': '300px'
+			});
+		}
+
+		kernel.showDialog([modalDiv, null, null, null], 'battleTunnel', '内网穿透对战 (秒连模式)', applyModalLayout);
+		applyModalLayout();
+
+		if (prefilledServer && prefilledRoom) {
+			setTimeout(function() {
+				btnConnect.click();
+			}, 100);
+		}
+	}
+
 	function leaveRoom(direct) {
 		if (!checkConnState(true) || !roomId) {
 			return;
@@ -1861,20 +2008,22 @@ var battle = execMain(function() {
 
 		if (!roomInfo) {
 			// 未加入房间时的操作界面
-			var headerTr = $('<tr>').append($('<td colspan=6 style="padding: 8px 4px; text-align: center;"></td>'));
-			var btnHost = $('<input type="button" class="buttonOK" value="👑 创建房间 (作为主机)" style="font-weight: bold; margin-right: 8px; padding: 4px 10px;">');
-			var btnClient = $('<input type="button" class="buttonOK" value="🎮 加入房间 (客户机)" style="font-weight: bold; margin-right: 8px; padding: 4px 10px;">');
-			var btnServer = $('<span class="click" style="font-size: 0.85em; color: #888; text-decoration: underline;">[官方服务器模式]</span>');
+			var headerTr = $('<tr>').append($('<td colspan=6 style="padding: 10px 4px; text-align: center;"></td>'));
+			var btnTunnel = $('<input type="button" class="buttonOK" value="🚀 穿透/服务器对战 (推荐)" style="font-weight: bold; margin-right: 8px; padding: 6px 14px; background: #2e7d32; color: #fff; cursor: pointer;">');
+			var btnHost = $('<input type="button" class="buttonOK" value="👑 P2P局域网主机" style="margin-right: 6px; padding: 5px 9px; font-size: 0.85em; cursor: pointer;">');
+			var btnClient = $('<input type="button" class="buttonOK" value="🎮 P2P选手加入" style="margin-right: 6px; padding: 5px 9px; font-size: 0.85em; cursor: pointer;">');
+			var btnServer = $('<span class="click" style="font-size: 0.8em; color: #888; text-decoration: underline; margin-left: 6px;">[官方公共服务]</span>');
 
+			btnTunnel.click(function() { showTunnelBattleModal(); });
 			btnHost.click(showHostModal);
 			btnClient.click(function() { showClientModal(); });
 			btnServer.click(joinServerRoom);
 
-			headerTr.find('td').append(btnHost, btnClient, $('<div style="margin-top: 6px;"></div>').append(btnServer));
+			headerTr.find('td').append(btnTunnel, btnHost, btnClient, $('<div style="margin-top: 8px;"></div>').append(btnServer));
 			roomTable.append(headerTr);
 
-			var infoText = '<b>设备对设备 P2P 直连</b>：房主作为主机掌控打乱与战局，选手直接与房主连接。<br>100% 离线免服务器，局域网极速 0 延迟！';
-			roomTable.append('<tr><td colspan=6 style="width:0; padding: 10px 4px; color: #666; font-size: 0.85em; text-align: center;">' + infoText + '</td></tr>');
+			var infoText = '<b>🌟 推荐【🚀 穿透/服务器对战】</b>：配合房主电脑内网穿透（如 cpolar / natfrp 等），好友点击链接秒连，100% 连通无阻！<br>若双方在同一 Wi-Fi 下，亦可选择 P2P 局域网直连。';
+			roomTable.append('<tr><td colspan=6 style="width:0; padding: 8px 4px; color: #666; font-size: 0.85em; text-align: center; line-height: 1.5;">' + infoText + '</td></tr>');
 		} else {
 			// 已在房间中的对战界面
 			var isHost = (battleMode === 'p2p_host');
@@ -2145,9 +2294,22 @@ var battle = execMain(function() {
 	function checkHashForOffer() {
 		var hash = window.location.hash || '';
 		if (hash.indexOf('battleOffer=') !== -1 || hash.indexOf('p2pOffer=') !== -1) {
-			var token = hash.split('=')[1];
+			var token = hash.split('battleOffer=')[1] || hash.split('p2pOffer=')[1];
 			if (token) {
+				token = token.split('&')[0];
 				showClientModal(token);
+			}
+		} else if (hash.indexOf('battleServer=') !== -1) {
+			var params = {};
+			var raw = hash.replace(/^#/, '');
+			raw.split('&').forEach(function(pair) {
+				var kv = pair.split('=');
+				if (kv.length === 2) params[kv[0]] = decodeURIComponent(kv[1]);
+			});
+			if (params['battleServer'] && params['room']) {
+				setTimeout(function() {
+					showTunnelBattleModal(params['battleServer'], params['room']);
+				}, 200);
 			}
 		}
 	}
