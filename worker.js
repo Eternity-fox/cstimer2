@@ -165,6 +165,45 @@ export class BattleRoom {
           if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
           this.broadcast(curRoom.roomId);
 
+        } else if (action === 'setMultiplier' && curRoom) {
+          const target = msg.targetAccountId;
+          const mult = parseFloat(msg.multiplier);
+          if (target && !isNaN(mult) && mult > 0) {
+            curRoom.multipliers[target] = mult;
+          }
+          if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
+          this.broadcast(curRoom.roomId);
+
+        } else if (action === 'advanceRound' && curRoom) {
+          curRoom.lastScramble = curRoom.curScramble;
+          if (msg.scramble) curRoom.curScramble = msg.scramble;
+          curRoom.curSolveId += 1;
+          for (const pl of curRoom.players.values()) pl.status = 'READY';
+          if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
+          this.broadcast(curRoom.roomId);
+
+        } else if (action === 'setAutoNext' && curRoom) {
+          curRoom.autoNext = !!msg.autoNext;
+          if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
+          this.broadcast(curRoom.roomId);
+
+        } else if (action === 'setScoreboardConfig' && curRoom) {
+          curRoom.scoreboard = curRoom.scoreboard || { enabled: true, x: 3, y: 5, scores: {}, bigScores: {}, winner: null };
+          if (msg.enabled !== undefined) curRoom.scoreboard.enabled = !!msg.enabled;
+          if (msg.x !== undefined) curRoom.scoreboard.x = parseInt(msg.x) || 3;
+          if (msg.y !== undefined) curRoom.scoreboard.y = parseInt(msg.y) || 5;
+          if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
+          this.broadcast(curRoom.roomId);
+
+        } else if (action === 'resetScoreboard' && curRoom) {
+          if (curRoom.scoreboard) {
+            curRoom.scoreboard.scores = {};
+            curRoom.scoreboard.bigScores = {};
+            curRoom.scoreboard.winner = null;
+          }
+          if (msgid) server.send(JSON.stringify({ msgid, ret: 0 }));
+          this.broadcast(curRoom.roomId);
+
         } else if (action === 'leaveRoom' && curRoom && curAccId) {
           curRoom.players.delete(curAccId);
           if (curRoom.players.size === 0) this.rooms.delete(curRoom.roomId);

@@ -76,7 +76,7 @@
   <script type="text/javascript" src="js/tools/bluetoothutil.js"></script>
   <script type="text/javascript" src="js/tools/metronome.js"></script>
   <script type="text/javascript" src="js/tools/onlinecomp.js"></script>
-  <script type="text/javascript" src="js/tools/battle.js"></script>
+  <script type="text/javascript" src="js/tools/battle.js?v=20261015_03"></script>
   <script type="text/javascript" src="js/tools/syncseed.js"></script>
   <script type="text/javascript" src="js/tools/bldhelper.js"></script>
   <script type="text/javascript" src="js/twisty/twistyreplay.js"></script>

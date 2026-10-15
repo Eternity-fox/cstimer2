@@ -19,6 +19,8 @@ var battle = execMain(function() {
 	var scrResolve = null;
 	var lastStatus = 'READY';
 	var playerSolvingStart = {}; // accountId -> 本地等效开始时间戳
+	var playerStoppedTimes = {}; // accountId -> finalMs (即时冻结的时间)
+	var lastRoundSolveId = null; // 当前对战轮次ID
 	var liveTimer = null;        // 实时刷新计时器
 	var currentHostToken = null;
 
@@ -1703,8 +1705,12 @@ var battle = execMain(function() {
 		checkConnState(false);
 		var modalDiv = $('<div style="text-align: left; padding: 14px; width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; font-size: 0.9em;"></div>');
 
-		var defServer = prefilledServer || localStorage.getItem('cstimer_tunnel_server') || 'cstimer2.eternity-fox.workers.dev';
-		var defRoom = prefilledRoom || roomId || ('' + (100 + ~~(Math.random() * 900)));
+		var savedServer = localStorage.getItem('cstimer_tunnel_server');
+		if (!savedServer || savedServer.indexOf('workers.dev') !== -1) {
+			savedServer = 'etfox.medscholar.icu';
+		}
+		var defServer = prefilledServer || savedServer;
+		var defRoom = prefilledRoom || roomId || '666';
 
 		var serverInput = $('<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px; font-size: 0.9em; margin: 4px 0 10px 0;">').val(defServer);
 		var roomInput = $('<input type="text" style="width: 140px; box-sizing: border-box; padding: 5px; font-size: 0.9em; margin: 4px 0 12px 0;">').val(defRoom);
@@ -1821,6 +1827,7 @@ var battle = execMain(function() {
 		roomInfo = null;
 		roomId = null;
 		compId = null;
+		playerStoppedTimes = {};
 		if (arena && arena.unmount) arena.unmount();
 		renderRoom();
 	}
@@ -1948,18 +1955,21 @@ var battle = execMain(function() {
 			} else if (obj['action'] === 'timerStop') {
 				var targetId = obj['accountId'];
 				if (targetId) {
+					var fMs = (typeof obj['finalMs'] === 'number') ? obj['finalMs'] : 0;
+					playerStoppedTimes[targetId] = fMs;
 					if (arena && arena.onTimerStop) {
-						arena.onTimerStop(targetId, obj['finalMs']);
+						arena.onTimerStop(targetId, fMs);
 					}
 					if (roomInfo && roomInfo.players) {
 						for (var pi = 0; pi < roomInfo.players.length; pi++) {
 							if (roomInfo.players[pi].accountId === targetId) {
 								roomInfo.players[pi].status = 'STOPPED';
-								roomInfo.players[pi].stoppedTime = obj['finalMs'];
+								roomInfo.players[pi].stoppedTime = fMs;
 								break;
 							}
 						}
 					}
+					renderRoom();
 				}
 				return;
 			} else if (obj['action'] === 'liveTick') {
@@ -1980,6 +1990,11 @@ var battle = execMain(function() {
 
 	function onRoomInfo() {
 		if (!roomInfo) return;
+		var curSolveId = (roomInfo['cur'] && roomInfo['cur'][0] !== undefined) ? roomInfo['cur'][0] : null;
+		if (lastRoundSolveId !== null && curSolveId !== null && lastRoundSolveId !== curSolveId) {
+			playerStoppedTimes = {};
+		}
+		lastRoundSolveId = curSolveId;
 		var newScr = roomInfo['cur'][1];
 		if (newScr && newScr !== localLastSolve[1]) {
 			if (kernel.getProp('scrType') !== 'remoteBattle') {
@@ -2136,10 +2151,6 @@ var battle = execMain(function() {
 	}
 
 	function onMultiplierClick(accId, name, currentM) {
-		if (battleMode !== 'p2p_host') {
-			alert('只有房主可以调节倍率');
-			return;
-		}
 		var input = prompt('设置【' + name + '】的倍率 (支持1位小数，如 0.8, 1.0, 1.2):', (currentM || 1.0).toFixed(1));
 		if (input === null) return;
 		var num = parseFloat(input);
@@ -2148,9 +2159,159 @@ var battle = execMain(function() {
 			return;
 		}
 		var newMult = Math.round(num * 10) / 10;
-		if (hostEngine && hostEngine.setMultiplier) {
+		if (battleMode === 'p2p_host' && hostEngine && hostEngine.setMultiplier) {
 			hostEngine.setMultiplier(accId, newMult);
+		} else {
+			conn.remoteCall({
+				'action': 'setMultiplier',
+				'roomId': roomId,
+				'targetAccountId': accId,
+				'multiplier': newMult
+			});
 		}
+	}
+
+	function showBattleSettingsModal() {
+		if (!roomInfo) return;
+		var sb = roomInfo.scoreboard || (hostEngine && hostEngine.getScoreboard ? hostEngine.getScoreboard() : { enabled: true, x: 3, y: 5, scores: {}, bigScores: {} }) || {};
+		var players = roomInfo.players || [];
+
+		var modalDiv = $('<div style="text-align: left; padding: 14px; width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; font-size: 0.9em; line-height: 1.6;"></div>');
+
+		modalDiv.append('<div style="font-weight: bold; font-size: 1.15em; margin-bottom: 12px; color: #0084a8;">⚙ 对战与计分设置</div>');
+
+		// 1. 是否开启计分
+		var chkScore = $('<input type="checkbox" ' + (sb.enabled ? 'checked' : '') + ' style="margin-right: 6px; cursor: pointer;">');
+		var scoreOptSec = $('<div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px dashed #ccc;"></div>')
+			.append($('<label style="font-weight: bold; cursor: pointer;"></label>').append(chkScore, '开启计分板'));
+		modalDiv.append(scoreOptSec);
+
+		// 2. 修改胜利条件（去除 x, y 字母，大分改为计分）
+		var inputPoint = $('<input type="number" min="1" max="99" value="' + (sb.x || 3) + '" style="width: 48px; text-align: center; margin: 0 4px; padding: 2px;">');
+		var inputTarget = $('<input type="number" min="1" max="99" value="' + (sb.y || 5) + '" style="width: 48px; text-align: center; margin: 0 4px; padding: 2px;">');
+		var ruleSec = $('<div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px dashed #ccc;">' +
+			'<div style="font-weight: bold; margin-bottom: 6px;">🎯 胜利条件设置：</div>' +
+			'</div>');
+		ruleSec.append(
+			$('<div>').append('单局局点：单局达到 ', inputPoint, ' 分胜出当前局'),
+			$('<div style="margin-top: 4px;">').append('全场夺冠：累计赢得 ', inputTarget, ' 计分夺冠')
+		);
+		modalDiv.append(ruleSec);
+
+		// 3. 修改选手当前比分（大分改为计分，去除 x, y）
+		var scoreEditSec = $('<div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px dashed #ccc;">' +
+			'<div style="font-weight: bold; margin-bottom: 6px;">📊 修改当前比分：</div>' +
+			'</div>');
+		var scoreInputs = {}; // accId -> { bigInput, smallInput }
+		var pTable = $('<table style="width: 100%; border-collapse: collapse; font-size: 0.9em;">' +
+			'<tr style="background: rgba(0,0,0,0.05);">' +
+			'<th style="padding: 4px; text-align: left;">选手</th>' +
+			'<th style="padding: 4px; text-align: center;">计分</th>' +
+			'<th style="padding: 4px; text-align: center;">分</th>' +
+			'</tr>' +
+			'</table>');
+
+		var curScores = sb.scores || {};
+		var curBigScores = sb.bigScores || {};
+		for (var pi = 0; pi < players.length; pi++) {
+			var pid = players[pi].accountId;
+			var pName = formatName(pid);
+			var bVal = curBigScores[pid] || 0;
+			var sVal = curScores[pid] || 0;
+			var bInput = $('<input type="number" min="0" max="99" value="' + bVal + '" style="width: 44px; text-align: center; padding: 2px;">');
+			var sInput = $('<input type="number" min="0" max="99" value="' + sVal + '" style="width: 44px; text-align: center; padding: 2px;">');
+			scoreInputs[pid] = { bigInput: bInput, smallInput: sInput };
+			var ptr = $('<tr>');
+			ptr.append(
+				$('<td style="padding: 4px; border-bottom: 1px solid #eee;">').text(pName),
+				$('<td style="padding: 4px; text-align: center; border-bottom: 1px solid #eee;">').append(bInput),
+				$('<td style="padding: 4px; text-align: center; border-bottom: 1px solid #eee;">').append(sInput)
+			);
+			pTable.append(ptr);
+		}
+		scoreEditSec.append(pTable);
+		modalDiv.append(scoreEditSec);
+
+		// 4. 重置比分按钮
+		var btnResetScore = $('<input type="button" value="🗑 重置所有比分为0" style="padding: 4px 10px; font-size: 0.85em; background: #ffebee; border: 1px solid #ef9a9a; color: #c62828; cursor: pointer; border-radius: 4px;">');
+		btnResetScore.click(function() {
+			if (confirm('确认将所有人的计分和比分清零重置？')) {
+				for (var k in scoreInputs) {
+					scoreInputs[k].bigInput.val(0);
+					scoreInputs[k].smallInput.val(0);
+				}
+				if (battleMode === 'p2p_host' && hostEngine) {
+					hostEngine.resetScoreboard();
+				} else {
+					conn.remoteCall({
+						'action': 'resetScoreboard',
+						'roomId': roomId
+					});
+				}
+				kernel.hideDialog();
+			}
+		});
+		var resetSec = $('<div style="margin-bottom: 14px;"></div>').append(btnResetScore);
+		modalDiv.append(resetSec);
+
+		// 5. 保存与取消按钮
+		var btnSave = $('<input type="button" class="buttonOK" value="✓ 保存设置" style="padding: 6px 16px; font-weight: bold; margin-right: 10px; cursor: pointer;">');
+		var btnCancel = $('<input type="button" value="取消" style="padding: 6px 12px; cursor: pointer;">');
+
+		btnCancel.click(function() {
+			kernel.hideDialog();
+		});
+
+		btnSave.click(function() {
+			var en = chkScore.prop('checked');
+			var point = parseInt(inputPoint.val()) || 3;
+			var target = parseInt(inputTarget.val()) || 5;
+
+			var newScores = {};
+			var newBigScores = {};
+			for (var k in scoreInputs) {
+				newBigScores[k] = parseInt(scoreInputs[k].bigInput.val()) || 0;
+				newScores[k] = parseInt(scoreInputs[k].smallInput.val()) || 0;
+			}
+
+			if (battleMode === 'p2p_host' && hostEngine) {
+				hostEngine.setScoreboardConfig(en, point, target);
+				var hsb = hostEngine.getScoreboard();
+				if (hsb) {
+					hsb.scores = newScores;
+					hsb.bigScores = newBigScores;
+				}
+			} else {
+				conn.remoteCall({
+					'action': 'setScoreboardConfig',
+					'roomId': roomId,
+					'enabled': en,
+					'x': point,
+					'y': target,
+					'scores': newScores,
+					'bigScores': newBigScores
+				});
+			}
+			kernel.hideDialog();
+			renderRoom();
+		});
+
+		var actionDiv = $('<div style="text-align: right; margin-top: 10px;"></div>').append(btnCancel, btnSave);
+		modalDiv.append(actionDiv);
+
+		function applySettingsLayout() {
+			$('.dialog').css({
+				'left': '20%',
+				'right': '20%',
+				'top': '12%',
+				'bottom': '12%',
+				'min-height': '360px',
+				'min-width': '280px'
+			});
+		}
+
+		kernel.showDialog([modalDiv, null, null, null], 'battleSettings', '比赛设置', applySettingsLayout);
+		applySettingsLayout();
 	}
 
 	function renderRoom() {
@@ -2161,11 +2322,11 @@ var battle = execMain(function() {
 			accountDiv.show();
 		}
 		roomTable.empty();
-		var titles = ['排名', '昵称', '倍率', '身份', '状态', '时间'];
+		var titles = ['排名', '昵称', '倍率', '状态', '时间'];
 
 		if (!roomInfo) {
 			// 未加入房间时的操作界面
-			var headerTr = $('<tr>').append($('<td colspan=6 style="padding: 10px 4px; text-align: center;"></td>'));
+			var headerTr = $('<tr>').append($('<td colspan=5 style="padding: 10px 4px; text-align: center;"></td>'));
 			var btnTunnel = $('<input type="button" class="buttonOK" value="🚀 穿透/服务器对战 (推荐)" style="font-weight: bold; margin-right: 8px; padding: 6px 14px; background: #2e7d32; color: #fff; cursor: pointer;">');
 			var btnHost = $('<input type="button" class="buttonOK" value="👑 P2P局域网主机" style="margin-right: 6px; padding: 5px 9px; font-size: 0.85em; cursor: pointer;">');
 			var btnClient = $('<input type="button" class="buttonOK" value="🎮 P2P选手加入" style="margin-right: 6px; padding: 5px 9px; font-size: 0.85em; cursor: pointer;">');
@@ -2180,75 +2341,41 @@ var battle = execMain(function() {
 			roomTable.append(headerTr);
 
 			var infoText = '<b>🌟 推荐【🚀 穿透/服务器对战】</b>：配合房主电脑内网穿透（如 cpolar / natfrp 等），好友点击链接秒连，100% 连通无阻！<br>若双方在同一 Wi-Fi 下，亦可选择 P2P 局域网直连。';
-			roomTable.append('<tr><td colspan=6 style="width:0; padding: 8px 4px; color: #666; font-size: 0.85em; text-align: center; line-height: 1.5;">' + infoText + '</td></tr>');
+			roomTable.append('<tr><td colspan=5 style="width:0; padding: 8px 4px; color: #666; font-size: 0.85em; text-align: center; line-height: 1.5;">' + infoText + '</td></tr>');
 		} else {
-			// 已在房间中的对战界面
-			var isHost = (battleMode === 'p2p_host');
-			var hostBadge = isHost ? '<span style="color:#f80;font-weight:bold;">[房主主机]</span> ' : (battleMode === 'server' ? '<span style="color:#4a90e2;">[服务器]</span> ' : '<span style="color:#2e7d32;">[客户机]</span> ');
-			var headRow = $('<tr>').append($('<td colspan=6 style="padding: 6px 4px;"></td>'));
+			// 已在房间中的对战界面（全员平权，均可进行房间操作）
+			var headRow = $('<tr>').append($('<td colspan=5 style="padding: 6px 4px;"></td>'));
 			headRow.find('td').append(
-				headStr[0] + ': <b>' + roomInfo['roomId'] + '</b> ' + hostBadge,
+				headStr[0] + ': <b>' + roomInfo['roomId'] + '</b>',
 				'&nbsp;',
 				leaveRoomSpan.html('[离开房间]').unbind('click').click(leaveRoom.bind(null, false)).show()
 			);
 
-			// 房主专属控制栏
-			if (isHost) {
-				var hostCtrl = $('<div style="margin-top: 5px; font-size: 0.9em;"></div>');
-				var btnNextScr = $('<input type="button" class="buttonOK" value="▶ 派发新打乱 (下一轮)" style="margin-right: 8px; font-size: 0.85em;">');
-				var btnInviteMore = $('<input type="button" value="+ 邀请新选手" style="margin-right: 8px; font-size: 0.85em;">');
-				var chkAuto = $('<label style="font-size: 0.85em; cursor: pointer;"><input type="checkbox" ' + (hostEngine.getAutoNext() ? 'checked' : '') + '> 全员完成自动下一轮</label>');
+			// 控制栏：派发新打乱按钮（全员完成自动下一轮已默认始终强制开启）
+			var roomCtrl = $('<div style="margin-top: 5px; font-size: 0.9em; text-align: center;"></div>');
+			var btnNextScr = $('<input type="button" class="buttonOK" value="▶ 派发新打乱 (下一轮)" style="font-size: 0.85em; padding: 3px 10px;">');
 
-				btnNextScr.click(function() {
+			btnNextScr.click(function() {
+				if (battleMode === 'p2p_host' && hostEngine) {
 					hostEngine.advanceRound();
-				});
-				btnInviteMore.click(function() {
-					showHostModal();
-				});
-				chkAuto.find('input').change(function() {
-					hostEngine.setAutoNext($(this).prop('checked'));
-				});
-
-				// 计分板设置控制栏
-				var sbState = (hostEngine.getScoreboard ? hostEngine.getScoreboard() : { enabled: false, x: 3, y: 5 }) || {};
-				var scoreCtrl = $('<div style="margin-top: 6px; padding-top: 5px; border-top: 1px dashed #ccc; font-size: 0.85em; display: flex; align-items: center; flex-wrap: wrap; gap: 6px;"></div>');
-				var chkScore = $('<label style="cursor: pointer; font-weight: bold;"><input type="checkbox" ' + (sbState.enabled ? 'checked' : '') + '> 开启计分板</label>');
-				var inputX = $('<input type="number" min="1" max="99" value="' + (sbState.x || 3) + '" style="width: 38px; text-align: center; margin: 0 2px;">');
-				var inputY = $('<input type="number" min="1" max="99" value="' + (sbState.y || 5) + '" style="width: 38px; text-align: center; margin: 0 2px;">');
-				var btnResetScore = $('<input type="button" value="重置比分" style="font-size: 0.8em; padding: 1px 6px;">');
-
-				function updateScoreCfg() {
-					var en = chkScore.find('input').prop('checked');
-					var vx = parseInt(inputX.val()) || 3;
-					var vy = parseInt(inputY.val()) || 5;
-					hostEngine.setScoreboardConfig(en, vx, vy);
+				} else {
+					conn.remoteCall({
+						'action': 'advanceRound',
+						'roomId': roomId,
+						'scramble': generate333Scramble()
+					});
 				}
-				chkScore.find('input').change(updateScoreCfg);
-				inputX.change(updateScoreCfg);
-				inputY.change(updateScoreCfg);
-				btnResetScore.click(function() {
-					if (confirm('确认重置当前计分与胜负状态？')) {
-						hostEngine.resetScoreboard();
-					}
-				});
+			});
 
-				scoreCtrl.append(
-					chkScore,
-					$('<span>').append('局点(x): ', inputX, ' 分'),
-					$('<span>').append('大分(y): ', inputY, ' 局'),
-					btnResetScore
-				);
-
-				hostCtrl.append(btnNextScr, btnInviteMore, chkAuto, scoreCtrl);
-				headRow.find('td').append(hostCtrl);
-			}
+			roomCtrl.append(btnNextScr);
+			headRow.find('td').append(roomCtrl);
 
 			roomTable.append(headRow);
 
 			if (roomInfo.scoreboard && roomInfo.scoreboard.enabled) {
 				var sb = roomInfo.scoreboard;
-				var sbRow = $('<tr><td colspan=6 style="padding: 4px; background: rgba(0, 132, 168, 0.08); text-align: center; font-size: 0.85em;"></td></tr>');
-				var sbTxt = '🏆 <b>抢分模式</b> (单局 ' + sb.x + ' 分胜出 | 抢 ' + sb.y + ' 局夺冠)';
+				var sbRow = $('<tr><td colspan=5 style="padding: 4px; background: rgba(0, 132, 168, 0.08); text-align: center; font-size: 0.85em;"></td></tr>');
+				var sbTxt = '(单局 ' + sb.x + ' 分胜出 | 抢 ' + sb.y + ' 局夺冠)';
 				if (sb.winner) {
 					sbTxt += '<br><b style="color:#d84315; font-size: 1.1em;">👑 最终胜者：' + formatName(sb.winner) + ' 赢得全场最终胜利！</b>';
 				}
@@ -2282,6 +2409,21 @@ var battle = execMain(function() {
 				var pSolves = solveDict[rawAccId] || {};
 				var pSolve = pSolves[curSolveId];
 				var rawMs = pSolve ? getSolveMillis(pSolve) : null;
+
+				// 即时保障：若网络尚未同步当前轮 solve，但本地已收到秒停或完成信号
+				if (rawMs === null) {
+					if (playerStoppedTimes[rawAccId] !== undefined) {
+						rawMs = playerStoppedTimes[rawAccId];
+					} else if (p.stoppedTime !== undefined && p.stoppedTime !== null) {
+						rawMs = p.stoppedTime;
+					} else if (rawAccId === compId && localLastSolve && localLastSolve[0]) {
+						var lPair = extractTimePair(localLastSolve);
+						if (lPair) {
+							rawMs = (lPair[0] === -1) ? -1 : (lPair[0] + lPair[1]);
+						}
+					}
+				}
+
 				var effMs = null;
 				if (rawMs !== null) {
 					effMs = (rawMs === -1) ? -1 : Math.round(rawMs * mult);
@@ -2290,6 +2432,26 @@ var battle = execMain(function() {
 						bestAccId = rawAccId;
 					}
 				}
+
+				// 判断玩家在当前轮的状态：
+				// 1. 若在计时，显示“还原中”
+				// 2. 若已完成还原（正在等待其他选手），显示“已完成”
+				// 3. 若在打乱、还未开始计时，显示“打乱/观察”
+				var pStatus = p['status'] || 'READY';
+				var isSolving = (pStatus === 'SOLVING') && (playerStoppedTimes[rawAccId] === undefined);
+				if (rawAccId === compId && lastStatus === 'SOLVING' && playerStoppedTimes[rawAccId] === undefined) {
+					isSolving = true;
+				}
+
+				var isFinished = false;
+				if (!isSolving) {
+					if (pStatus === 'SOLVED' || pStatus === 'STOPPED' || playerStoppedTimes[rawAccId] !== undefined || (pSolve !== undefined && pSolve !== null)) {
+						isFinished = true;
+					} else if (rawAccId === compId && lastStatus === 'READY' && localLastSolve && localLastSolve[0] && localLastSolve[0][1] > 0) {
+						isFinished = true;
+					}
+				}
+
 				playerStats.push({
 					player: p,
 					rawAccId: rawAccId,
@@ -2298,14 +2460,16 @@ var battle = execMain(function() {
 					pSolve: pSolve,
 					rawMs: rawMs,
 					effMs: effMs,
-					status: p['status']
+					status: pStatus,
+					isSolving: isSolving,
+					isFinished: isFinished
 				});
 			}
 
 			// 排名排序：已完成成绩按 effMs 升序排序，未完成的排在后面
 			playerStats.sort(function(a, b) {
-				var va = (a.effMs !== null && a.status === 'SOLVED') ? (a.effMs === -1 ? 999999998 : a.effMs) : 999999999;
-				var vb = (b.effMs !== null && b.status === 'SOLVED') ? (b.effMs === -1 ? 999999998 : b.effMs) : 999999999;
+				var va = (a.effMs !== null && a.isFinished) ? (a.effMs === -1 ? 999999998 : a.effMs) : 999999999;
+				var vb = (b.effMs !== null && b.isFinished) ? (b.effMs === -1 ? 999999998 : b.effMs) : 999999999;
 				return va - vb;
 			});
 
@@ -2328,46 +2492,47 @@ var battle = execMain(function() {
 					var pSmall = (sb.scores && sb.scores[rawAccId]) || 0;
 					var pBig = (sb.bigScores && sb.bigScores[rawAccId]) || 0;
 					var isWinner = (sb.winner === rawAccId);
-					account += ' <span style="color:#0084a8; font-size: 0.85em; font-weight: bold;">[' + pBig + '大分 | ' + pSmall + '分]</span>';
+					account += ' <span style="color:#0084a8; font-size: 0.85em; font-weight: bold;">(' + pBig + '|' + pSmall + ')</span>';
 					if (isWinner) {
 						account += ' 👑';
 					}
 				}
 
-				var isSolved = ps.status === 'SOLVED';
-				var isSolving = ps.status === 'SOLVING';
-				var isInspect = ps.status === 'INSPECT';
-				var lastTimeStr = 'N/A';
+				// 状态与右下角成绩显示，严格按照用户要求：
+				// 若在计时，则显示“还原中”
+				// 若在打乱，还未开始计时，则显示“打乱/观察”
+				// 若已完成还原，正在等待另一位或者其他选手完成还原，那么则显示“已完成”
+				var statusDisplay = '';
+				var lastTimeStr = '--:--';
 
-				if (isSolving && playerSolvingStart[rawAccId] !== undefined) {
-					var elapsed = (Date.now() - playerSolvingStart[rawAccId]) / 1000;
-					var effElapsed = elapsed * ps.mult;
-					lastTimeStr = '<span style="color:#4a90e2;font-weight:bold">' + effElapsed.toFixed(2) + '</span>';
-				} else if (isInspect) {
-					lastTimeStr = '<span style="color:#f80">检查中</span>';
-				} else if (isSolved && ps.effMs !== null) {
-					var formattedEff = (ps.effMs === -1) ? 'DNF' : (ps.effMs / 1000).toFixed(2);
-					if (rawAccId === bestAccId) {
-						lastTimeStr = '<span style="color:#008000;font-weight:bold;">' + formattedEff + '</span>';
+				if (ps.player.status === 'LOSS') {
+					statusDisplay = '<span style="color:#999;">掉线</span>';
+					lastTimeStr = '-';
+				} else if (ps.isSolving) {
+					statusDisplay = '<span style="color:#0288d1;font-weight:bold;">还原中</span>';
+					if (playerSolvingStart[rawAccId] !== undefined) {
+						var elapsed = (Date.now() - playerSolvingStart[rawAccId]) / 1000;
+						var effElapsed = elapsed * ps.mult;
+						lastTimeStr = '<span style="color:#0288d1;font-weight:bold">' + effElapsed.toFixed(2) + '</span>';
 					} else {
-						lastTimeStr = '<span style="color:#f00;font-weight:bold;">' + formattedEff + '</span>';
+						lastTimeStr = '<span style="color:#0288d1;font-weight:bold">--:--</span>';
+					}
+				} else if (ps.isFinished) {
+					statusDisplay = '<span style="color:#2e7d32;font-weight:bold;">已完成</span>';
+					if (ps.effMs !== null) {
+						var formattedEff = (ps.effMs === -1) ? 'DNF' : (ps.effMs / 1000).toFixed(2);
+						if (rawAccId === bestAccId) {
+							lastTimeStr = '<span style="color:#008000;font-weight:bold;">' + formattedEff + '</span>';
+						} else {
+							lastTimeStr = '<span style="color:#f00;font-weight:bold;">' + formattedEff + '</span>';
+						}
+					} else {
+						lastTimeStr = '<span style="color:#2e7d32;font-weight:bold;">OK</span>';
 					}
 				} else {
-					// 未完成当前轮，向前找最近一把历史成绩
-					var prevSolve = null;
-					for (var sid = curSolveId - 1; sid >= 1; sid--) {
-						if (ps.pSolves[sid]) {
-							prevSolve = ps.pSolves[sid];
-							break;
-						}
-					}
-					if (prevSolve) {
-						var prevRawMs = getSolveMillis(prevSolve);
-						if (prevRawMs !== null) {
-							var prevEff = (prevRawMs === -1) ? 'DNF' : (Math.round(prevRawMs * ps.mult) / 1000).toFixed(2);
-							lastTimeStr = '<span style="color:#888;">' + prevEff + '</span>';
-						}
-					}
+					// 打乱/观察状态
+					statusDisplay = '<span style="color:#e65100;">打乱/观察</span>';
+					lastTimeStr = '<span style="color:#888;">--:--</span>';
 				}
 
 				var tr = $('<tr></tr>');
@@ -2375,20 +2540,24 @@ var battle = execMain(function() {
 				tr.append('<td>' + account + '</td>');
 
 				var multTd = $('<td>' + ps.mult.toFixed(1) + '</td>');
-				if (isHost) {
-					multTd.addClass('battle-mult-click').attr('title', '点击修改该成员倍率').click((function(acc, name, m) {
-						return function(e) {
-							e.stopPropagation();
-							onMultiplierClick(acc, name, m);
-						};
-					})(rawAccId, formatName(rawAccId), ps.mult));
-				}
+				multTd.addClass('battle-mult-click').attr('title', '点击修改该成员倍率').click((function(acc, name, m) {
+					return function(e) {
+						e.stopPropagation();
+						onMultiplierClick(acc, name, m);
+					};
+				})(rawAccId, formatName(rawAccId), ps.mult));
 				tr.append(multTd);
-				tr.append('<td>' + roleText + '</td>');
-				tr.append('<td>' + (statusMap[['READY', 'INSPECT', 'SOLVING', 'SOLVED', 'LOSS'].indexOf(ps.status) + 1] || ps.status) + '</td>');
+				tr.append('<td>' + statusDisplay + '</td>');
 				tr.append('<td>' + lastTimeStr + '</td>');
 				roomTable.append(tr);
 			}
+
+			// 右下角面板中的左下角：【⚙ 设置】按钮
+			var bottomRow = $('<tr><td colspan=5 style="padding: 8px 4px 4px 4px; text-align: left; background: none; border: none;"></td></tr>');
+			var btnSettings = $('<input type="button" value="⚙ 设置" style="font-size: 0.85em; padding: 2px 8px; cursor: pointer; border-radius: 3px; background: #f0f0f0; border: 1px solid #bbb;">');
+			btnSettings.click(showBattleSettingsModal);
+			bottomRow.find('td').append(btnSettings);
+			roomTable.append(bottomRow);
 		}
 	}
 
@@ -2516,21 +2685,21 @@ var battle = execMain(function() {
 			timerTable.addClass('in-battle-mode');
 			$('#container').addClass('battle-pane-self');
 
-			// 己方计分板方框：[大比分] [小比分]
+			// 己方计分板方框：[计分] [分]
 			if (!$('#battle-self-score-group').length) {
 				$('#container').prepend('<div id="battle-self-score-group" class="battle-score-group">' +
-					'<div class="battle-score-box big-score" id="battle-self-big" title="大比分">0</div>' +
-					'<div class="battle-score-box small-score" id="battle-self-small" title="小比分">0</div>' +
+					'<div class="battle-score-box big-score" id="battle-self-big" title="计分">0</div>' +
+					'<div class="battle-score-box small-score" id="battle-self-small" title="分">0</div>' +
 					'</div>');
 			}
 
 			// 检查是否已有对手面板，若无则添加（默认为 1v1 右侧面板）
-			// 对手方框为对称排列：紧贴中线为 [小比分]，外侧为 [大比分]
+			// 对手方框为对称排列：紧贴中线为 [分]，外侧为 [计分]
 			if (!$('#battle-opp-container').length) {
 				var oppTd = $('<td id="battle-opp-container" class="battle-pane-right battle-pane-opp">' +
 					'<div id="battle-opp-score-group" class="battle-score-group">' +
-					'<div class="battle-score-box small-score" id="battle-opp-small" title="小比分">0</div>' +
-					'<div class="battle-score-box big-score" id="battle-opp-big" title="大比分">0</div>' +
+					'<div class="battle-score-box small-score" id="battle-opp-small" title="分">0</div>' +
+					'<div class="battle-score-box big-score" id="battle-opp-big" title="计分">0</div>' +
 					'</div>' +
 					'<div id="battle-opp-lcd">--:--</div>' +
 					'<div id="battle-opp-avgstr" class="battle-opp-avgstr"><span>ao5: -</span><br><span>ao12: -</span></div>' +
@@ -2638,15 +2807,22 @@ var battle = execMain(function() {
 			for (var pi = 0; pi < players.length; pi++) {
 				var pid = players[pi]['accountId'];
 				var pSol = solveDict[pid] && solveDict[pid][curSolveId];
-				if (pSol && players[pi]['status'] === 'SOLVED') {
-					var pRaw = getSolveMillis(pSol);
-					if (pRaw !== null && pRaw > 0) {
-						var pMult = getPlayerMultiplier(pid);
-						var pEff = Math.round(pRaw * pMult);
-						if (pEff < bestEffMs) {
-							bestEffMs = pEff;
-							bestAccId = pid;
-						}
+				var pRaw = pSol ? getSolveMillis(pSol) : null;
+				if (pRaw === null) {
+					if (stoppedTimes[pid] !== undefined) {
+						pRaw = stoppedTimes[pid];
+					} else if (playerStoppedTimes[pid] !== undefined) {
+						pRaw = playerStoppedTimes[pid];
+					} else if (players[pi].stoppedTime !== undefined && players[pi].stoppedTime !== null) {
+						pRaw = players[pi].stoppedTime;
+					}
+				}
+				if (pRaw !== null && pRaw > 0) {
+					var pMult = getPlayerMultiplier(pid);
+					var pEff = Math.round(pRaw * pMult);
+					if (pEff < bestEffMs) {
+						bestEffMs = pEff;
+						bestAccId = pid;
 					}
 				}
 			}
@@ -2660,14 +2836,17 @@ var battle = execMain(function() {
 					break;
 				}
 			}
-			if (selfSolve) {
+			var selfRawMs = selfSolve ? getSolveMillis(selfSolve) : null;
+			if (selfRawMs === null && playerStoppedTimes[compId] !== undefined) {
+				selfRawMs = playerStoppedTimes[compId];
+			}
+			if (selfRawMs !== null) {
 				var sidUsed = (solveDict[compId] && solveDict[compId][curSolveId]) ? curSolveId : (curSolveId - 1);
 				var selfMult = getPlayerMultiplier(compId);
-				var selfRawMs = getSolveMillis(selfSolve);
 				var selfEffMs = (selfRawMs === -1) ? -1 : Math.round(selfRawMs * selfMult);
 				var selfEffStr = (selfEffMs === -1) ? '(DNF)' : '(' + (selfEffMs / 1000).toFixed(2) + ')';
 				var isWinnerSelf = false;
-				if (sidUsed === curSolveId) {
+				if (sidUsed === curSolveId || playerStoppedTimes[compId] !== undefined) {
 					isWinnerSelf = (compId === bestAccId);
 				} else {
 					var sbWinner = (roomInfo.scoreboard && roomInfo.scoredSolveIds && roomInfo.scoredSolveIds[sidUsed]) || null;
@@ -2745,15 +2924,24 @@ var battle = execMain(function() {
 				var opp = otherPlayers[0];
 				var oppId = opp['accountId'];
 				var oppStatus = opp['status'] || 'READY';
+				var oppMult = getPlayerMultiplier(oppId);
 
 				// 刷新对手的 ao5 和 ao12 显示
 				updatePlayerAvgStr($('#battle-opp-avgstr'), oppId);
 
-				if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined) {
-					delete liveTickMap[oppId];
-					var dispMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (opp.stoppedTime || 0);
-					oppLcd.html(kernel.pretty(Math.max(0, dispMs), true));
-				} else if (oppStatus === 'SOLVING') {
+				var oppRawMs = null;
+				var isCurrentRoundOpp = false;
+
+				if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined || playerStoppedTimes[oppId] !== undefined) {
+					oppRawMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (playerStoppedTimes[oppId] !== undefined ? playerStoppedTimes[oppId] : (opp.stoppedTime || 0));
+					isCurrentRoundOpp = true;
+				} else if (oppStatus === 'SOLVED') {
+					var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
+					oppRawMs = oppSolve ? getSolveMillis(oppSolve) : ((stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (playerStoppedTimes[oppId] !== undefined ? playerStoppedTimes[oppId] : (opp.stoppedTime || 0)));
+					isCurrentRoundOpp = true;
+				}
+
+				if (oppStatus === 'SOLVING') {
 					var now = Date.now();
 					var elapsed = 0;
 					if (liveTickMap[oppId]) {
@@ -2762,40 +2950,35 @@ var battle = execMain(function() {
 					} else if (playerSolvingStart[oppId]) {
 						elapsed = now - playerSolvingStart[oppId];
 					}
-					// 实时以数字跳动显示对手的用时（大字为实际时间）
-					oppLcd.html(kernel.pretty(Math.max(0, elapsed), true));
+					var effElapsed = elapsed * oppMult;
+					var liveDiffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:#4a90e2;">(' + (effElapsed / 1000).toFixed(2) + ')</span>';
+					oppLcd.html(kernel.pretty(Math.max(0, elapsed), true) + liveDiffHtml);
 				} else if (oppStatus === 'INSPECT') {
 					delete liveTickMap[oppId];
-					delete stoppedTimes[oppId];
 					oppLcd.html('15');
-				} else if (oppStatus === 'SOLVED') {
+				} else if (isCurrentRoundOpp && oppRawMs !== null) {
 					delete liveTickMap[oppId];
-					delete stoppedTimes[oppId];
-					var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
-					var formattedOppRaw = formatSolveTime(oppSolve, true); // 大字：实际时间
-					var oppRawMs = getSolveMillis(oppSolve);
-					var oppMult = getPlayerMultiplier(oppId);
 					var oppEffMs = (oppRawMs === -1) ? -1 : Math.round(oppRawMs * oppMult);
-					var oppEffStr = (oppEffMs === -1) ? '(DNF)' : '(' + (oppEffMs / 1000).toFixed(2) + ')'; // 括号：乘以倍率之后的时间
-					var oppColor = (oppId === bestAccId) ? '#008000' : '#f00'; // 第一名绿色，其余红色
-					var diffHtml = '<div class="difflabel" style="color:' + oppColor + ';">' + oppEffStr + '</div>';
-					oppLcd.html(formattedOppRaw + diffHtml);
+					var oppEffStr = (oppEffMs === -1) ? '(DNF)' : '(' + (oppEffMs / 1000).toFixed(2) + ')';
+					var oppColor = (oppId === bestAccId) ? '#008000' : '#f00';
+					var diffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:' + oppColor + ';">' + oppEffStr + '</span>';
+					oppLcd.html(kernel.pretty(Math.max(0, oppRawMs), true) + diffHtml);
 				} else {
 					delete liveTickMap[oppId];
-					delete stoppedTimes[oppId];
-					// READY 状态，若有上一把成绩则显示上一把及折算括号时间，否则显示 --:--
 					var lastSid = curSolveId - 1;
 					var prevS = solveDict[oppId] && solveDict[oppId][lastSid];
 					if (prevS) {
-						var formattedPrev = formatSolveTime(prevS, true);
 						var prevRawMs = getSolveMillis(prevS);
-						var prevMult = getPlayerMultiplier(oppId);
-						var prevEffMs = (prevRawMs === -1) ? -1 : Math.round(prevRawMs * prevMult);
-						var prevEffStr = (prevEffMs === -1) ? '(DNF)' : '(' + (prevEffMs / 1000).toFixed(2) + ')';
-						var sbWinner = (roomInfo.scoreboard && roomInfo.scoredSolveIds && roomInfo.scoredSolveIds[lastSid]) || null;
-						var prevColor = (sbWinner === oppId) ? '#008000' : '#f00';
-						var prevDiffHtml = '<div class="difflabel" style="color:' + prevColor + ';">' + prevEffStr + '</div>';
-						oppLcd.html(formattedPrev + prevDiffHtml);
+						if (prevRawMs !== null) {
+							var prevEffMs = (prevRawMs === -1) ? -1 : Math.round(prevRawMs * oppMult);
+							var prevEffStr = (prevEffMs === -1) ? '(DNF)' : '(' + (prevEffMs / 1000).toFixed(2) + ')';
+							var sbWinner = (roomInfo.scoreboard && roomInfo.scoredSolveIds && roomInfo.scoredSolveIds[lastSid]) || null;
+							var prevColor = (sbWinner === oppId) ? '#008000' : '#f00';
+							var prevDiffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:' + prevColor + ';">' + prevEffStr + '</span>';
+							oppLcd.html(formatSolveTime(prevS, true) + prevDiffHtml);
+						} else {
+							oppLcd.html('--:--');
+						}
 					} else {
 						oppLcd.html('--:--');
 					}
@@ -2806,17 +2989,26 @@ var battle = execMain(function() {
 					var opp = otherPlayers[oi];
 					var oppId = opp['accountId'];
 					var oppStatus = opp['status'] || 'READY';
+					var oppMult = getPlayerMultiplier(oppId);
 					var oppLcd = $('#battle-lcd-' + oi);
 					if (!oppLcd.length) continue;
 
 					// 刷新对应对手的 ao5 和 ao12
 					updatePlayerAvgStr($('#battle-avgstr-' + oi), oppId);
 
-					if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined) {
-						delete liveTickMap[oppId];
-						var dispMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (opp.stoppedTime || 0);
-						oppLcd.html(kernel.pretty(Math.max(0, dispMs), true));
-					} else if (oppStatus === 'SOLVING') {
+					var oppRawMs = null;
+					var isCurrentRoundOpp = false;
+
+					if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined || playerStoppedTimes[oppId] !== undefined) {
+						oppRawMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (playerStoppedTimes[oppId] !== undefined ? playerStoppedTimes[oppId] : (opp.stoppedTime || 0));
+						isCurrentRoundOpp = true;
+					} else if (oppStatus === 'SOLVED') {
+						var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
+						oppRawMs = oppSolve ? getSolveMillis(oppSolve) : ((stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (playerStoppedTimes[oppId] !== undefined ? playerStoppedTimes[oppId] : (opp.stoppedTime || 0)));
+						isCurrentRoundOpp = true;
+					}
+
+					if (oppStatus === 'SOLVING') {
 						var now = Date.now();
 						var elapsed = 0;
 						if (liveTickMap[oppId]) {
@@ -2825,38 +3017,35 @@ var battle = execMain(function() {
 						} else if (playerSolvingStart[oppId]) {
 							elapsed = now - playerSolvingStart[oppId];
 						}
-						oppLcd.html(kernel.pretty(Math.max(0, elapsed), true));
+						var effElapsed = elapsed * oppMult;
+						var liveDiffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:#4a90e2;">(' + (effElapsed / 1000).toFixed(2) + ')</span>';
+						oppLcd.html(kernel.pretty(Math.max(0, elapsed), true) + liveDiffHtml);
 					} else if (oppStatus === 'INSPECT') {
 						delete liveTickMap[oppId];
-						delete stoppedTimes[oppId];
 						oppLcd.html('15');
-					} else if (oppStatus === 'SOLVED') {
+					} else if (isCurrentRoundOpp && oppRawMs !== null) {
 						delete liveTickMap[oppId];
-						delete stoppedTimes[oppId];
-						var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
-						var formattedOppRaw = formatSolveTime(oppSolve, true); // 大字：实际时间
-						var oppRawMs = getSolveMillis(oppSolve);
-						var oppMult = getPlayerMultiplier(oppId);
 						var oppEffMs = (oppRawMs === -1) ? -1 : Math.round(oppRawMs * oppMult);
-						var oppEffStr = (oppEffMs === -1) ? '(DNF)' : '(' + (oppEffMs / 1000).toFixed(2) + ')'; // 括号：乘以倍率之后的时间
-						var oppColor = (oppId === bestAccId) ? '#008000' : '#f00'; // 第一名绿色，其余红色
-						var diffHtml = '<div class="difflabel" style="color:' + oppColor + ';">' + oppEffStr + '</div>';
-						oppLcd.html(formattedOppRaw + diffHtml);
+						var oppEffStr = (oppEffMs === -1) ? '(DNF)' : '(' + (oppEffMs / 1000).toFixed(2) + ')';
+						var oppColor = (oppId === bestAccId) ? '#008000' : '#f00';
+						var diffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:' + oppColor + ';">' + oppEffStr + '</span>';
+						oppLcd.html(kernel.pretty(Math.max(0, oppRawMs), true) + diffHtml);
 					} else {
 						delete liveTickMap[oppId];
-						delete stoppedTimes[oppId];
 						var lastSid = curSolveId - 1;
 						var prevS = solveDict[oppId] && solveDict[oppId][lastSid];
 						if (prevS) {
-							var formattedPrev = formatSolveTime(prevS, true);
 							var prevRawMs = getSolveMillis(prevS);
-							var prevMult = getPlayerMultiplier(oppId);
-							var prevEffMs = (prevRawMs === -1) ? -1 : Math.round(prevRawMs * prevMult);
-							var prevEffStr = (prevEffMs === -1) ? '(DNF)' : '(' + (prevEffMs / 1000).toFixed(2) + ')';
-							var sbWinner = (roomInfo.scoreboard && roomInfo.scoredSolveIds && roomInfo.scoredSolveIds[lastSid]) || null;
-							var prevColor = (sbWinner === oppId) ? '#008000' : '#f00';
-							var prevDiffHtml = '<div class="difflabel" style="color:' + prevColor + ';">' + prevEffStr + '</div>';
-							oppLcd.html(formattedPrev + prevDiffHtml);
+							if (prevRawMs !== null) {
+								var prevEffMs = (prevRawMs === -1) ? -1 : Math.round(prevRawMs * oppMult);
+								var prevEffStr = (prevEffMs === -1) ? '(DNF)' : '(' + (prevEffMs / 1000).toFixed(2) + ')';
+								var sbWinner = (roomInfo.scoreboard && roomInfo.scoredSolveIds && roomInfo.scoredSolveIds[lastSid]) || null;
+								var prevColor = (sbWinner === oppId) ? '#008000' : '#f00';
+								var prevDiffHtml = ' <span class="difflabel" style="display:inline-block; font-size:0.25em; margin-left:8px; vertical-align:baseline; color:' + prevColor + ';">' + prevEffStr + '</span>';
+								oppLcd.html(formatSolveTime(prevS, true) + prevDiffHtml);
+							} else {
+								oppLcd.html('--:--');
+							}
 						} else {
 							oppLcd.html('--:--');
 						}
@@ -2914,16 +3103,16 @@ var battle = execMain(function() {
 
 				if (!$('#battle-self-score-group').length) {
 					$('#container').prepend('<div id="battle-self-score-group" class="battle-score-group">' +
-						'<div class="battle-score-box big-score" id="battle-self-big" title="大比分">0</div>' +
-						'<div class="battle-score-box small-score" id="battle-self-small" title="小比分">0</div>' +
+						'<div class="battle-score-box big-score" id="battle-self-big" title="计分">0</div>' +
+						'<div class="battle-score-box small-score" id="battle-self-small" title="分">0</div>' +
 						'</div>');
 				}
 
 				for (var oi = 0; oi < otherPlayers.length; oi++) {
 					var multiTd = $('<td class="battle-pane-right battle-pane-opp battle-pane-multi" id="battle-container-' + oi + '">' +
 						'<div class="battle-score-group" id="battle-score-group-' + oi + '">' +
-						'<div class="battle-score-box big-score" id="battle-big-' + oi + '" title="大比分">0</div>' +
-						'<div class="battle-score-box small-score" id="battle-small-' + oi + '" title="小比分">0</div>' +
+						'<div class="battle-score-box big-score" id="battle-big-' + oi + '" title="计分">0</div>' +
+						'<div class="battle-score-box small-score" id="battle-small-' + oi + '" title="分">0</div>' +
 						'</div>' +
 						'<div id="battle-lcd-' + oi + '">--:--</div>' +
 						'<div class="battle-opp-avgstr" id="battle-avgstr-' + oi + '"><span>ao5: -</span><br><span>ao12: -</span></div>' +
@@ -2964,6 +3153,7 @@ var battle = execMain(function() {
 			}
 			if (status && status != lastStatus) {
 				lastStatus = status;
+				delete playerStoppedTimes[compId];
 				submitStatus(status);
 				if (arena) {
 					if (status === 'SOLVING') {
@@ -2973,11 +3163,15 @@ var battle = execMain(function() {
 					}
 					if (roomInfo) arena.sync(roomInfo);
 				}
+				renderRoom();
 			} else if (value === 0) {
 				lastStatus = 'READY';
 				if (arena) arena.stopLocalBroadcast();
+				var curMs = (timer && timer.getCurTime) ? timer.getCurTime() : 0;
+				if (curMs > 0) playerStoppedTimes[compId] = curMs;
 				// 当松手/敲击空格使计时器停止的一瞬间，极速通知对手立即定格！
-				sendFastStop();
+				sendFastStop(curMs);
+				renderRoom();
 			}
 			return;
 		}
@@ -2985,15 +3179,19 @@ var battle = execMain(function() {
 		if (signal == 'timestd') {
 			if (arena) arena.stopLocalBroadcast();
 			var finalMs = (value && value[0] && value[0][1]) ? value[0][1] : undefined;
+			if (finalMs !== undefined) playerStoppedTimes[compId] = finalMs;
 			sendFastStop(finalMs);
 			submitSolve(value, false);
 			if (arena && roomInfo) arena.sync(roomInfo);
+			renderRoom();
 		} else if (signal == 'timepnt') {
 			if (arena) arena.stopLocalBroadcast();
 			var finalMs = (value && value[0] && value[0][1]) ? value[0][1] : undefined;
+			if (finalMs !== undefined) playerStoppedTimes[compId] = finalMs;
 			sendFastStop(finalMs);
 			submitSolve(value, true);
 			if (arena && roomInfo) arena.sync(roomInfo);
+			renderRoom();
 		}
 	}
 

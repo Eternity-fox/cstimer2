@@ -379,6 +379,69 @@ async def handle_ws_session(reader, writer):
                         await writer.drain()
                     await broadcast_room(current_room)
 
+            elif action == "setMultiplier":
+                if current_room:
+                    target = msg.get("targetAccountId")
+                    mult = float(msg.get("multiplier", 1.0))
+                    if target and mult > 0:
+                        current_room["multipliers"][target] = mult
+                    if msg_id:
+                        ack = encode_ws_frame(json.dumps({"msgid": msg_id, "ret": 0}))
+                        writer.write(ack)
+                        await writer.drain()
+                    await broadcast_room(current_room)
+
+            elif action == "advanceRound":
+                if current_room:
+                    current_room["lastScramble"] = current_room["curScramble"]
+                    next_scr = msg.get("scramble")
+                    if next_scr:
+                        current_room["curScramble"] = next_scr
+                    current_room["curSolveId"] += 1
+                    for pid in current_room["players"]:
+                        current_room["players"][pid]["status"] = "READY"
+                    if msg_id:
+                        ack = encode_ws_frame(json.dumps({"msgid": msg_id, "ret": 0}))
+                        writer.write(ack)
+                        await writer.drain()
+                    await broadcast_room(current_room)
+
+            elif action == "setAutoNext":
+                if current_room:
+                    current_room["autoNext"] = bool(msg.get("autoNext", True))
+                    if msg_id:
+                        ack = encode_ws_frame(json.dumps({"msgid": msg_id, "ret": 0}))
+                        writer.write(ack)
+                        await writer.drain()
+                    await broadcast_room(current_room)
+
+            elif action == "setScoreboardConfig":
+                if current_room:
+                    sb = current_room.setdefault("scoreboard", {"enabled": True, "x": 3, "y": 5, "scores": {}, "bigScores": {}, "winner": None})
+                    if "enabled" in msg:
+                        sb["enabled"] = bool(msg["enabled"])
+                    if "x" in msg:
+                        sb["x"] = int(msg["x"])
+                    if "y" in msg:
+                        sb["y"] = int(msg["y"])
+                    if msg_id:
+                        ack = encode_ws_frame(json.dumps({"msgid": msg_id, "ret": 0}))
+                        writer.write(ack)
+                        await writer.drain()
+                    await broadcast_room(current_room)
+
+            elif action == "resetScoreboard":
+                if current_room and "scoreboard" in current_room:
+                    sb = current_room["scoreboard"]
+                    sb["scores"] = {}
+                    sb["bigScores"] = {}
+                    sb["winner"] = None
+                    if msg_id:
+                        ack = encode_ws_frame(json.dumps({"msgid": msg_id, "ret": 0}))
+                        writer.write(ack)
+                        await writer.drain()
+                    await broadcast_room(current_room)
+
             elif action == "leaveRoom":
                 if current_room and current_acc_id:
                     remove_player_from_room(current_room, current_acc_id)
@@ -428,6 +491,9 @@ async def handle_http_request(method, path, writer):
         "HTTP/1.1 200 OK\r\n"
         f"Content-Type: {content_type}\r\n"
         f"Content-Length: {file_size}\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Expires: 0\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Connection: close\r\n"
         "\r\n"
