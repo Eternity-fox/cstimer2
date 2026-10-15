@@ -15,7 +15,8 @@ export class BattleRoom {
         elo: p.elo || 1500,
         status: p.status || 'READY',
         isHost: p.isHost || false,
-        multiplier: room.multipliers[p.accountId] || 1.0
+        multiplier: room.multipliers[p.accountId] || 1.0,
+        stoppedTime: p.stoppedTime
       })),
       cur: [room.curSolveId, room.curScramble],
       last: [room.curSolveId - 1, room.lastScramble],
@@ -51,6 +52,46 @@ export class BattleRoom {
         const action = msg.action;
         const msgid = msg.msgid;
 
+        // 1. 心跳保活：立即响应，防止 Cloudflare 100秒无操作强制断开
+        if (action === 'heartBeat') {
+          try {
+            server.send(JSON.stringify({ action: 'heartBeatAck', ret: 0, msgid: msgid }));
+          } catch (e) {}
+          return;
+        }
+
+        // 2. 极速时钟转发：无缓冲直达对手，消除网络堆积
+        if (action === 'liveTick' && curRoom && curAccId) {
+          const tickStr = JSON.stringify(msg);
+          for (const pl of curRoom.players.values()) {
+            if (pl.ws !== server) {
+              try { pl.ws.send(tickStr); } catch (e) {}
+            }
+          }
+          return;
+        }
+
+        // 3. 极速停止计时广播：在选手松手/敲击空格瞬间立即让对手界面定格，彻底消灭1~2秒及更久延迟！
+        if (action === 'timerStop' && curRoom && curAccId) {
+          const p = curRoom.players.get(curAccId);
+          if (p) {
+            p.status = 'STOPPED';
+            p.stoppedTime = msg.finalMs;
+          }
+          const stopStr = JSON.stringify({
+            action: 'timerStop',
+            accountId: curAccId,
+            stopAt: msg.stopAt || Date.now(),
+            finalMs: msg.finalMs
+          });
+          for (const pl of curRoom.players.values()) {
+            if (pl.ws !== server) {
+              try { pl.ws.send(stopStr); } catch (e) {}
+            }
+          }
+          return;
+        }
+
         if (action === 'joinRoom') {
           const roomId = String(msg.roomId || '666').trim();
           let accId = String(msg.accountId || 'Player').trim();
@@ -74,6 +115,9 @@ export class BattleRoom {
           // 防止同名覆盖（例如两端默认都叫 Player_123）
           if (curRoom.players.has(accId) && curRoom.players.get(accId).ws !== server) {
             accId = accId + '_' + Math.floor(Math.random() * 90 + 10);
+            try {
+              server.send(JSON.stringify({ action: 'setAccountId', accountId: accId }));
+            } catch (e) {}
           }
           curAccId = accId;
 

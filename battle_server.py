@@ -149,6 +149,15 @@ async def handle_connection(reader, writer):
     peer = writer.get_extra_info('peername')
     print(f"\n[收到新连接] 来源: {peer}")
     try:
+        # 开启 TCP_NODELAY 彻底关闭 Nagle 算法，消除 200ms~500ms 缓冲延迟
+        sock = writer.get_extra_info('socket')
+        if sock:
+            try:
+                import socket
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except Exception:
+                pass
+
         # 读取 HTTP 请求头（超时5秒防止挂起）
         request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
         if not request_line:
@@ -239,7 +248,48 @@ async def handle_ws_session(reader, writer):
             action = msg.get("action")
             msg_id = msg.get("msgid")
 
-            if action == "joinRoom":
+            # 心跳保活处理：立即应答，防止 NAT 超时静默断流
+            if action == "heartBeat":
+                ack = encode_ws_frame(json.dumps({"action": "heartBeatAck", "ret": 0, "msgid": msg_id}))
+                writer.write(ack)
+                await writer.drain()
+                continue
+
+            # 极速时钟跳动转发：零缓冲直接推向其他选手
+            elif action == "liveTick" and current_room and current_acc_id:
+                tick_bytes = encode_ws_frame(text)
+                for pid, pl in current_room["players"].items():
+                    if pid != current_acc_id:
+                        w = pl.get("writer")
+                        if w and not w.is_closing():
+                            try:
+                                w.write(tick_bytes)
+                            except Exception:
+                                pass
+                continue
+
+            # 极速停止计时广播：在选手松手/敲击空格瞬间立即让对手界面定格，彻底消灭1~2秒延迟！
+            elif action == "timerStop" and current_room and current_acc_id:
+                if current_acc_id in current_room["players"]:
+                    current_room["players"][current_acc_id]["status"] = "STOPPED"
+                    current_room["players"][current_acc_id]["stoppedTime"] = msg.get("finalMs")
+                stop_bytes = encode_ws_frame(json.dumps({
+                    "action": "timerStop",
+                    "accountId": current_acc_id,
+                    "stopAt": msg.get("stopAt", int(time.time() * 1000)),
+                    "finalMs": msg.get("finalMs")
+                }))
+                for pid, pl in current_room["players"].items():
+                    if pid != current_acc_id:
+                        w = pl.get("writer")
+                        if w and not w.is_closing():
+                            try:
+                                w.write(stop_bytes)
+                            except Exception:
+                                pass
+                continue
+
+            elif action == "joinRoom":
                 room_id = str(msg.get("roomId", "100")).strip()
                 acc_id = str(msg.get("accountId", "Player")).strip()
                 scramble = msg.get("scramble")

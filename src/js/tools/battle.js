@@ -225,6 +225,44 @@ var battle = execMain(function() {
 		var toResolves = [];
 		var activeWsUrl = 'wss://cstimer.net/ws20230409';
 
+		var heartbeatTimer = null;
+		var lastRecvTime = Date.now();
+
+		function startHeartbeat() {
+			stopHeartbeat();
+			heartbeatTimer = setInterval(function() {
+				if (isOpen && socket && socket.readyState === WebSocket.OPEN) {
+					try {
+						socket.send(JSON.stringify({ action: 'heartBeat' }));
+					} catch (e) {}
+					// 若连续 30 秒无任何下行数据且仍在对战中，判定为静默断流并主动重连
+					if (Date.now() - lastRecvTime > 30000 && roomId && compId) {
+						console.warn('[wsConn] WebSocket silent over 30s, reconnecting...');
+						reconnect();
+					}
+				}
+			}, 10000); // 每 10 秒心跳保活，穿透 NAT 防火墙并防止 Cloudflare 100 秒断连
+		}
+
+		function stopHeartbeat() {
+			if (heartbeatTimer) {
+				clearInterval(heartbeatTimer);
+				heartbeatTimer = null;
+			}
+		}
+
+		function reconnect() {
+			if (!activeWsUrl) return;
+			stopHeartbeat();
+			try { if (socket) socket.close(); } catch (e) {}
+			isOpen = false;
+			connect(activeWsUrl).then(function() {
+				if (roomId && compId) {
+					joinServerRoomWithId(roomId);
+				}
+			}).catch(function() {});
+		}
+
 		function formatWsUrl(raw) {
 			if (!raw) {
 				var proto = (location.protocol === 'https:') ? 'wss://' : 'ws://';
@@ -246,7 +284,7 @@ var battle = execMain(function() {
 		function connect(targetUrl) {
 			targetUrl = formatWsUrl(targetUrl || activeWsUrl);
 			activeWsUrl = targetUrl;
-			if (isOpen && socket && socket.url === targetUrl) {
+			if (isOpen && socket && socket.url === targetUrl && socket.readyState === WebSocket.OPEN) {
 				return Promise.resolve();
 			}
 			if (socket) {
@@ -272,23 +310,32 @@ var battle = execMain(function() {
 				}
 				socket.onopen = function() {
 					isOpen = true;
+					lastRecvTime = Date.now();
+					startHeartbeat();
 					while (toResolves.length > 0) {
 						toResolves.pop()();
 					}
 				};
 				socket.onclose = function() {
 					isOpen = false;
+					stopHeartbeat();
 					callback && callback('close');
+					if (battleMode === 'server' && roomId && compId) {
+						setTimeout(reconnect, 2000);
+					}
 				};
 				socket.onerror = function(err) {
 					clearTimeout(connectTimer);
 					isOpen = false;
+					stopHeartbeat();
 					reject(new Error('无法连接到 WebSocket 服务器: ' + targetUrl));
 					callback && callback('error');
 				};
 				socket.onmessage = function(e) {
+					lastRecvTime = Date.now();
 					try {
 						var msg = JSON.parse(e.data);
+						if (msg.action === 'heartBeatAck') return;
 						var msgid = msg['msgid'];
 						if (msgid in waitList) {
 							var res = waitList[msgid];
@@ -321,14 +368,19 @@ var battle = execMain(function() {
 		}
 
 		function pushMsg(msg) {
-			if (!isOpen) return -1;
-			socket.send(JSON.stringify(msg));
-			return 0;
+			if (!isOpen || !socket || socket.readyState !== WebSocket.OPEN) return -1;
+			try {
+				socket.send(JSON.stringify(msg));
+				return 0;
+			} catch (e) {
+				return -1;
+			}
 		}
 
 		function close() {
+			stopHeartbeat();
 			if (!isOpen) return -1;
-			socket.close();
+			try { socket.close(); } catch (e) {}
 			isOpen = false;
 			return 0;
 		}
@@ -336,6 +388,7 @@ var battle = execMain(function() {
 		return {
 			connect: connect,
 			close: close,
+			reconnect: reconnect,
 			isConnected: function() { return isOpen; },
 			setCallback: function(cb) { callback = cb; },
 			pushMsg: pushMsg,
@@ -539,6 +592,21 @@ var battle = execMain(function() {
 					clientObj.dc.send(JSON.stringify({ msgid: msg.msgid, ret: 0 }));
 				}
 				broadcast();
+			} else if (action === 'timerStop') {
+				if (state.players[accId]) {
+					state.players[accId].status = 'STOPPED';
+					state.players[accId].stoppedTime = msg.finalMs;
+				}
+				if (arena && arena.onTimerStop) {
+					arena.onTimerStop(accId, msg.finalMs);
+				}
+				var stopStr = JSON.stringify(msg);
+				for (var ci = 0; ci < state.clients.length; ci++) {
+					var otherCl = state.clients[ci];
+					if (otherCl !== clientObj && otherCl.dc && otherCl.dc.readyState === 'open') {
+						try { otherCl.dc.send(stopStr); } catch (e) {}
+					}
+				}
 			} else if (action === 'liveTick') {
 				if (arena && arena.onLiveTick) {
 					arena.onLiveTick(accId, msg.curTime);
@@ -547,12 +615,15 @@ var battle = execMain(function() {
 				for (var ci = 0; ci < state.clients.length; ci++) {
 					var otherCl = state.clients[ci];
 					if (otherCl !== clientObj && otherCl.dc && otherCl.dc.readyState === 'open') {
+						if (otherCl.dc.bufferedAmount > 2048) continue; // 缓冲区有堆积时丢弃过期时钟包
 						try { otherCl.dc.send(tickStr); } catch (e) {}
 					}
 				}
 			} else if (action === 'heartBeat') {
 				if (msg.msgid) {
-					clientObj.dc.send(JSON.stringify({ msgid: msg.msgid, ret: 0 }));
+					try {
+						clientObj.dc.send(JSON.stringify({ msgid: msg.msgid, ret: 0 }));
+					} catch (e) {}
 				}
 			}
 		}
@@ -882,12 +953,31 @@ var battle = execMain(function() {
 
 		function broadcastMsg(msg) {
 			var str = JSON.stringify(msg);
+			var isTick = (msg && msg.action === 'liveTick');
 			for (var i = 0; i < state.clients.length; i++) {
 				var cl = state.clients[i];
 				if (cl.dc && cl.dc.readyState === 'open') {
+					if (isTick && cl.dc.bufferedAmount > 2048) continue; // 缓冲区堵塞时跳过时钟帧
 					try { cl.dc.send(str); } catch (e) {}
 				}
 			}
+		}
+
+		function hostPlayerStop(accId, stopAt, finalMs) {
+			if (state.players[accId]) {
+				state.players[accId].status = 'STOPPED';
+				state.players[accId].stoppedTime = finalMs;
+			}
+			if (arena && arena.onTimerStop) {
+				arena.onTimerStop(accId, finalMs);
+			}
+			var stopMsg = {
+				action: 'timerStop',
+				accountId: accId,
+				stopAt: stopAt,
+				finalMs: finalMs
+			};
+			broadcastMsg(stopMsg);
 		}
 
 		function addClient(clientObj) {
@@ -899,6 +989,7 @@ var battle = execMain(function() {
 			advanceRound: advanceRound,
 			hostUpdateStatus: hostUpdateStatus,
 			hostUploadSolve: hostUploadSolve,
+			hostPlayerStop: hostPlayerStop,
 			handleClientMessage: handleClientMessage,
 			handleClientDisconnect: handleClientDisconnect,
 			addClient: addClient,
@@ -980,8 +1071,27 @@ var battle = execMain(function() {
 			}
 		}
 
+		var p2pHeartbeatTimer = null;
+
+		function startP2pHeartbeat() {
+			stopP2pHeartbeat();
+			p2pHeartbeatTimer = setInterval(function() {
+				if (dc && dc.readyState === 'open') {
+					try { dc.send(JSON.stringify({ action: 'heartBeat' })); } catch (e) {}
+				}
+			}, 8000); // 8 秒发一次轻量保活，防止国内家庭宽带/校园网 NAT 打洞映射快速老化失效
+		}
+
+		function stopP2pHeartbeat() {
+			if (p2pHeartbeatTimer) {
+				clearInterval(p2pHeartbeatTimer);
+				p2pHeartbeatTimer = null;
+			}
+		}
+
 		function connReady() {
 			kernel.hideDialog();
+			startP2pHeartbeat();
 			var joinMsg = {
 				'action': 'joinRoom',
 				'roomId': roomId,
@@ -1024,6 +1134,10 @@ var battle = execMain(function() {
 			if (!dc) return -1;
 			try {
 				if (dc.readyState === 'open') {
+					// 缓冲区堆积保护：如果是时钟包且已有堆积，立即丢弃过时包，杜绝阻塞后续的成绩提交包
+					if (msg && msg.action === 'liveTick' && dc.bufferedAmount > 2048) {
+						return 0;
+					}
 					dc.send(JSON.stringify(msg));
 					return 0;
 				}
@@ -1034,6 +1148,7 @@ var battle = execMain(function() {
 		}
 
 		function close() {
+			stopP2pHeartbeat();
 			if (dc) {
 				try { dc.close(); } catch (e) {}
 			}
@@ -1588,7 +1703,7 @@ var battle = execMain(function() {
 		checkConnState(false);
 		var modalDiv = $('<div style="text-align: left; padding: 14px; width: 100%; height: 100%; box-sizing: border-box; overflow-y: auto; font-size: 0.9em;"></div>');
 
-		var defServer = prefilledServer || localStorage.getItem('cstimer_tunnel_server') || ((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+		var defServer = prefilledServer || localStorage.getItem('cstimer_tunnel_server') || 'cstimer2.eternity-fox.workers.dev';
 		var defRoom = prefilledRoom || roomId || ('' + (100 + ~~(Math.random() * 900)));
 
 		var serverInput = $('<input type="text" style="width: 100%; box-sizing: border-box; padding: 5px; font-size: 0.9em; margin: 4px 0 10px 0;">').val(defServer);
@@ -1736,6 +1851,22 @@ var battle = execMain(function() {
 		return compId;
 	}
 
+	function sendFastStop(finalMs) {
+		if (!checkConnState(true) || !roomId) return;
+		var stopMsg = {
+			'action': 'timerStop',
+			'roomId': roomId,
+			'accountId': compId,
+			'stopAt': Date.now(),
+			'finalMs': (finalMs !== undefined) ? finalMs : (timer && timer.getCurTime ? timer.getCurTime() : 0)
+		};
+		if (battleMode === 'p2p_host') {
+			hostEngine.hostPlayerStop(compId, stopMsg.stopAt, stopMsg.finalMs);
+		} else {
+			conn.pushMsg(stopMsg);
+		}
+	}
+
 	function submitStatus(status) {
 		if (!checkConnState(true) || !roomId) {
 			return;
@@ -1814,6 +1945,23 @@ var battle = execMain(function() {
 				}
 				onRoomInfo();
 				if (arena && arena.sync) arena.sync(roomInfo);
+			} else if (obj['action'] === 'timerStop') {
+				var targetId = obj['accountId'];
+				if (targetId) {
+					if (arena && arena.onTimerStop) {
+						arena.onTimerStop(targetId, obj['finalMs']);
+					}
+					if (roomInfo && roomInfo.players) {
+						for (var pi = 0; pi < roomInfo.players.length; pi++) {
+							if (roomInfo.players[pi].accountId === targetId) {
+								roomInfo.players[pi].status = 'STOPPED';
+								roomInfo.players[pi].stoppedTime = obj['finalMs'];
+								break;
+							}
+						}
+					}
+				}
+				return;
 			} else if (obj['action'] === 'liveTick') {
 				if (arena && arena.onLiveTick) {
 					arena.onLiveTick(obj['accountId'], obj['curTime']);
@@ -2328,6 +2476,7 @@ var battle = execMain(function() {
 		var isMounted = false;
 		var liveBroadcastTimer = null;
 		var liveTickMap = {}; // accountId -> { curTime: number, recvAt: number }
+		var stoppedTimes = {}; // accountId -> number (即时冻结对手时间)
 		var animFrameId = null;
 
 		function syncTimerStyles() {
@@ -2409,6 +2558,7 @@ var battle = execMain(function() {
 
 			isMounted = false;
 			liveTickMap = {};
+			stoppedTimes = {};
 		}
 
 		function startLocalBroadcast() {
@@ -2425,9 +2575,11 @@ var battle = execMain(function() {
 						hostEngine.broadcastMsg(msg);
 					} else if (battleMode === 'p2p_client') {
 						clientConn.pushMsg(msg);
+					} else if (battleMode === 'server') {
+						wsConn.pushMsg(msg);
 					}
 				}
-			}, 50);
+			}, 120); // 降频至约 8Hz，大幅削减网络吞吐，杜绝 UDP/SCTP 队列积压
 		}
 
 		function stopLocalBroadcast() {
@@ -2438,10 +2590,16 @@ var battle = execMain(function() {
 		}
 
 		function onLiveTick(accId, curTime) {
+			if (stoppedTimes[accId] !== undefined) return; // 已收到秒停指令，丢弃网络延迟的旧帧
 			liveTickMap[accId] = {
 				curTime: curTime,
 				recvAt: Date.now()
 			};
+		}
+
+		function onTimerStop(accId, finalMs) {
+			delete liveTickMap[accId];
+			stoppedTimes[accId] = (typeof finalMs === 'number') ? finalMs : 0;
 		}
 
 		function startAnimLoop() {
@@ -2591,7 +2749,11 @@ var battle = execMain(function() {
 				// 刷新对手的 ao5 和 ao12 显示
 				updatePlayerAvgStr($('#battle-opp-avgstr'), oppId);
 
-				if (oppStatus === 'SOLVING') {
+				if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined) {
+					delete liveTickMap[oppId];
+					var dispMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (opp.stoppedTime || 0);
+					oppLcd.html(kernel.pretty(Math.max(0, dispMs), true));
+				} else if (oppStatus === 'SOLVING') {
 					var now = Date.now();
 					var elapsed = 0;
 					if (liveTickMap[oppId]) {
@@ -2604,9 +2766,11 @@ var battle = execMain(function() {
 					oppLcd.html(kernel.pretty(Math.max(0, elapsed), true));
 				} else if (oppStatus === 'INSPECT') {
 					delete liveTickMap[oppId];
+					delete stoppedTimes[oppId];
 					oppLcd.html('15');
 				} else if (oppStatus === 'SOLVED') {
 					delete liveTickMap[oppId];
+					delete stoppedTimes[oppId];
 					var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
 					var formattedOppRaw = formatSolveTime(oppSolve, true); // 大字：实际时间
 					var oppRawMs = getSolveMillis(oppSolve);
@@ -2618,6 +2782,7 @@ var battle = execMain(function() {
 					oppLcd.html(formattedOppRaw + diffHtml);
 				} else {
 					delete liveTickMap[oppId];
+					delete stoppedTimes[oppId];
 					// READY 状态，若有上一把成绩则显示上一把及折算括号时间，否则显示 --:--
 					var lastSid = curSolveId - 1;
 					var prevS = solveDict[oppId] && solveDict[oppId][lastSid];
@@ -2647,7 +2812,11 @@ var battle = execMain(function() {
 					// 刷新对应对手的 ao5 和 ao12
 					updatePlayerAvgStr($('#battle-avgstr-' + oi), oppId);
 
-					if (oppStatus === 'SOLVING') {
+					if (oppStatus === 'STOPPED' || stoppedTimes[oppId] !== undefined) {
+						delete liveTickMap[oppId];
+						var dispMs = (stoppedTimes[oppId] !== undefined) ? stoppedTimes[oppId] : (opp.stoppedTime || 0);
+						oppLcd.html(kernel.pretty(Math.max(0, dispMs), true));
+					} else if (oppStatus === 'SOLVING') {
 						var now = Date.now();
 						var elapsed = 0;
 						if (liveTickMap[oppId]) {
@@ -2659,9 +2828,11 @@ var battle = execMain(function() {
 						oppLcd.html(kernel.pretty(Math.max(0, elapsed), true));
 					} else if (oppStatus === 'INSPECT') {
 						delete liveTickMap[oppId];
+						delete stoppedTimes[oppId];
 						oppLcd.html('15');
 					} else if (oppStatus === 'SOLVED') {
 						delete liveTickMap[oppId];
+						delete stoppedTimes[oppId];
 						var oppSolve = solveDict[oppId] && solveDict[oppId][curSolveId];
 						var formattedOppRaw = formatSolveTime(oppSolve, true); // 大字：实际时间
 						var oppRawMs = getSolveMillis(oppSolve);
@@ -2673,6 +2844,7 @@ var battle = execMain(function() {
 						oppLcd.html(formattedOppRaw + diffHtml);
 					} else {
 						delete liveTickMap[oppId];
+						delete stoppedTimes[oppId];
 						var lastSid = curSolveId - 1;
 						var prevS = solveDict[oppId] && solveDict[oppId][lastSid];
 						if (prevS) {
@@ -2769,6 +2941,7 @@ var battle = execMain(function() {
 			unmount: unmount,
 			sync: sync,
 			onLiveTick: onLiveTick,
+			onTimerStop: onTimerStop,
 			startLocalBroadcast: startLocalBroadcast,
 			stopLocalBroadcast: stopLocalBroadcast
 		};
@@ -2803,16 +2976,22 @@ var battle = execMain(function() {
 			} else if (value === 0) {
 				lastStatus = 'READY';
 				if (arena) arena.stopLocalBroadcast();
+				// 当松手/敲击空格使计时器停止的一瞬间，极速通知对手立即定格！
+				sendFastStop();
 			}
 			return;
 		}
 		value = JSON.parse(JSON.stringify(value));
 		if (signal == 'timestd') {
 			if (arena) arena.stopLocalBroadcast();
+			var finalMs = (value && value[0] && value[0][1]) ? value[0][1] : undefined;
+			sendFastStop(finalMs);
 			submitSolve(value, false);
 			if (arena && roomInfo) arena.sync(roomInfo);
 		} else if (signal == 'timepnt') {
 			if (arena) arena.stopLocalBroadcast();
+			var finalMs = (value && value[0] && value[0][1]) ? value[0][1] : undefined;
+			sendFastStop(finalMs);
 			submitSolve(value, true);
 			if (arena && roomInfo) arena.sync(roomInfo);
 		}
