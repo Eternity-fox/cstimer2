@@ -1,0 +1,24 @@
+# Realm 端口转发配置文件
+# 官方项目: https://github.com/zhboner/realm
+
+[network]
+# 是否禁用 TCP（false 表示开启 TCP 转发）
+no_tcp = false
+# 是否开启 UDP 转发
+use_udp = true
+
+# ================= 转发规则配置 =================
+# 示例 1: 基础转发（请修改下面的 remote 目标 IP 和端口）
+[[endpoints]]
+listen = "0.0.0.0:8888"        # 中转机监听端口
+remote = "1.2.3.4:8888"        # 目标服务器 IP 与端口
+
+# 示例 2: 域名目标转发（如果目标使用了动态域名或 CDN）
+# [[endpoints]]
+# listen = "0.0.0.0:9999"
+# remote = "example.com:443"
+
+# 示例 3: 多端口中转（需要转发多个端口时，复制本段即可）
+# [[endpoints]]
+# listen = "0.0.0.0:10000"
+# remote = "1.2.3.4:10000"

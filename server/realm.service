@@ -1,0 +1,13 @@
+[Unit]
+Description=Realm Port Forwarding Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/realm -c /etc/realm/config.toml
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
